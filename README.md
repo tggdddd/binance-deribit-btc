@@ -1,4 +1,4 @@
-# Binance-Deribit BTC 跨所套利机器人
+# Binance-Deribit BTC 跨所套利自动化交易程序
 
 这是一个面向 Deribit 期权与 Binance USDT-M 永续合约的跨交易所套利/对冲项目。项目包含套利扫描、下单执行、持仓监控、结算处理、Redis 状态恢复、Telegram 告警与 Web 监控面板。
 

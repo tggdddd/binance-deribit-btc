@@ -752,6 +752,17 @@ class StartupMixin:
                                     _alloc = min(_alloc, _ea)
                                     _allocated_sum += _alloc
                                     _old_qty = _rs.binance_filled_qty
+                                    # 🌟 CR-1 修复: 启动重建必然处于数据预热期内, 基于可能假空的
+                                    # 读数向下修正 (尤其清零) 会无门禁固化进 Redis — 与 6-11 事故同类。
+                                    # 向下修正一律延后, 留给预热期满后的常规对账 (带全套门禁) 处理;
+                                    # 向上/持平修正 (恢复跟踪) 不受影响。
+                                    if _alloc < _old_qty:
+                                        _trusted_rb, _why_rb = self._binance_position_data_trusted()
+                                        if not (_trusted_rb or self._bn_zero_reading_human_ack_active()):
+                                            logger.warning(
+                                                f"[{_es[0]}-{_es[1]}] Hedge重建: 向下修正 {_old_qty}→{_alloc} "
+                                                f"被预热门禁延后 ({_why_rb}), 保留保守跟踪值待常规对账处理")
+                                            continue
                                     if abs(_alloc - _old_qty) > _tol:
                                         _rs.binance_filled_qty = _alloc
                                         _rs.binance_open_qty = _alloc

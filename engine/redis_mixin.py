@@ -81,6 +81,11 @@ class RedisMixin:
                 'hedge_close_completed_ts': float(getattr(state, '_hedge_close_completed_ts', 0.0)),
                 'settle_retries': int(getattr(state, '_settle_retries', 0)),
                 'settle_last_attempt_ts': float(getattr(state, '_settle_last_attempt_ts', 0.0)),
+                # 🌟 ARCH-05④: 估算价标记持久化, 防止平仓中途重启后把估算价当真实成交价记录
+                'bn_entry_price_estimated': bool(getattr(state, '_bn_entry_price_estimated', False)),
+                'bn_close_price_estimated': bool(getattr(state, '_bn_close_price_estimated', False)),
+                # 🌟 R4-2: 真实成交台账 (CR-2 中证据依据), 跨重启保留
+                'bn_closed_qty_total': str(getattr(state, 'binance_closed_qty_total', '0') or '0'),
             }
             # 保存合约名称，重启后无需依赖 arbitrage_combinations 重建
             combination = self.arbitrage_combinations.get(state.expiry_strike)
@@ -317,6 +322,14 @@ class RedisMixin:
                             if _sr_h > 0:
                                 _hold_state._settle_retries = _sr_h
                                 _hold_state._settle_last_attempt_ts = float(data.get('settle_last_attempt_ts', 0.0) or 0.0)
+                            if data.get('bn_entry_price_estimated'):
+                                _hold_state._bn_entry_price_estimated = True
+                            if data.get('bn_close_price_estimated'):
+                                _hold_state._bn_close_price_estimated = True
+                            try:
+                                _hold_state.binance_closed_qty_total = Decimal(str(data.get('bn_closed_qty_total', '0') or '0'))
+                            except Exception:
+                                pass
                             self.arbitrage_states[(expiry, strike)] = _hold_state
                             self.position_locks.add((expiry, strike))
                             recovered_count += 1
@@ -374,6 +387,14 @@ class RedisMixin:
                         if _sr_t > 0:
                             _tmp_state._settle_retries = _sr_t
                             _tmp_state._settle_last_attempt_ts = float(data.get('settle_last_attempt_ts', 0.0) or 0.0)
+                        if data.get('bn_entry_price_estimated'):
+                            _tmp_state._bn_entry_price_estimated = True
+                        if data.get('bn_close_price_estimated'):
+                            _tmp_state._bn_close_price_estimated = True
+                        try:
+                            _tmp_state.binance_closed_qty_total = Decimal(str(data.get('bn_closed_qty_total', '0') or '0'))
+                        except Exception:
+                            pass
                         # 🌟 P1-B 修复: 将 _tmp_state 注入 arbitrage_states 和 position_locks
                         # 旧逻辑: _tmp_state 只在异步任务中使用，不注入主状态机 →
                         #   结算首次失败后 monitor_positions 不会重试，且幽灵检测可能误平
@@ -506,6 +527,14 @@ class RedisMixin:
                 if _sr > 0:
                     state._settle_retries = _sr
                     state._settle_last_attempt_ts = float(data.get('settle_last_attempt_ts', 0.0) or 0.0)
+                if data.get('bn_entry_price_estimated'):
+                    state._bn_entry_price_estimated = True
+                if data.get('bn_close_price_estimated'):
+                    state._bn_close_price_estimated = True
+                try:
+                    state.binance_closed_qty_total = Decimal(str(data.get('bn_closed_qty_total', '0') or '0'))
+                except Exception:
+                    pass
                 self.arbitrage_states[(expiry, strike)] = state
                 self.position_locks.add((expiry, strike))
                 recovered_count += 1

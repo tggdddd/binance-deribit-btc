@@ -497,11 +497,23 @@ class RunMixin:
                                     # 🌟 缺陷B修复: 同步 positions 字典（与启动路径和 WS 推送一致）
                                     if hasattr(self.binance_ws, '_rebuild_net_position'):
                                         self.binance_ws._rebuild_net_position(_perp)
-                                    logger.info(f"✅ Binance 持仓快照已刷新 ({_refreshed} 条活跃持仓)")
+                                    # 🌟 ARCH-09 修复: 重连后数据连续性已断, 重新武装预热时钟 —
+                                    # 接下来 warmup 期内的空仓读数不可作为破坏性动作依据
+                                    self.binance_ws.position_snapshot_ok = True
+                                    self.binance_ws.position_snapshot_at = time.time()
+                                    logger.info(f"✅ Binance 持仓快照已刷新 ({_refreshed} 条活跃持仓), 预热重新计时")
                                 else:
-                                    logger.warning("⚠️ Binance 恢复后持仓快照刷新失败，等待下次 WS 推送修正")
+                                    # 刷新失败 → 撤销可信标记, 空仓读数在下次成功读取+预热前不可信
+                                    self.binance_ws.position_snapshot_ok = False
+                                    logger.warning("⚠️ Binance 恢复后持仓快照刷新失败，等待下次 WS 推送修正 (空仓读数暂不可信)")
                             except Exception as _refresh_err:
-                                logger.warning(f"⚠️ Binance 恢复后持仓刷新异常: {_refresh_err}")
+                                # 🌟 A4-3/G4-02: 刷新异常时持仓字典可能半更新, 撤销可信标记
+                                # (与 _risks is None 分支语义对齐, 下次成功读取经 RISK-1 钩子恢复)
+                                try:
+                                    self.binance_ws.position_snapshot_ok = False
+                                except Exception:
+                                    pass
+                                logger.warning(f"⚠️ Binance 恢复后持仓刷新异常: {_refresh_err} (空仓读数暂不可信)")
 
                             # 🌟 P1-1 修复: Binance 重连后重试参数设置 (杠杆/保证金模式)
                             # 初始化时若因网络抖动设置失败, "Binance参数设置失败" 暂停永远不会被清除

@@ -141,9 +141,18 @@ class RealTimeArbitrageEngineCore:
         self._bn_side_integrity_interval = 5.0
         self._bn_side_integrity_alert_ts = 0.0
         self._bn_side_integrity_tolerance = Decimal('0.001')
-        self._bn_hedge_missing_since: Dict[Tuple[str, Decimal], float] = {}
+        # 注: 对冲缺失计时/确认计数挂在 ArbitrageState 实例上 (state._bn_hedge_missing_*),
+        # 引擎级不再保留同名字典 (DEAD-1 清理, 防误用)
         self._bn_hedge_missing_alert_ts = 0.0
-        self._bn_hedge_missing_grace_sec = 8.0
+        # 🌟 2026-06-11 幻影空仓事故: 宽限 8s → 30s + 连续确认 + 数据预热门禁
+        self._bn_hedge_missing_grace_sec = 30.0
+        self._bn_hedge_missing_warmup_sec = 120.0  # Binance WS 重建后空仓读数预热期
+        self._bn_hedge_missing_min_confirms = 3    # 断尾前需连续 N 次独立确认
+        # 操作员 /start 解除"Binance持仓数据可疑"的时间戳: 15 分钟内空仓读数视为人工已确认
+        # (防死锁: 对冲真在引擎离线期间被外部平掉时, 因果证据永远无法出现, 须有人工通道)
+        self._bn_suspect_human_ack_ts = 0.0
+        # 数据可疑暂停被 auto-resolve (数据自证恢复) 的时刻 (R4-1: /start ack 登记判据)
+        self._bn_suspect_auto_resolved_ts = 0.0
         self._bn_residual_recheck_last_ts = 0.0
         self._bn_residual_recheck_interval = 5.0
         self._bn_residual_pause_log_ts = 0.0
@@ -214,6 +223,9 @@ class RealTimeArbitrageEngineCore:
         self._bn_mark_degraded_log_ts: Dict[Tuple[str, Decimal], float] = {}
         self._combo_fail_count: Dict[Tuple[str, Decimal], int] = {}
         self._combo_cooldown_until: Dict[Tuple[str, Decimal], float] = {}
+        # 🌟 2026-06-11: 交易所拒单升级冷却 (与良性利润撤单分开计数) + 失败计数衰减时间戳
+        self._combo_reject_streak: Dict[Tuple, int] = {}
+        self._combo_last_fail_ts: Dict[Tuple[str, Decimal], float] = {}
         self.max_funding_rate_pct = Decimal('0.05')
         self.min_depth_ratio = Decimal('0.5')
 
@@ -270,6 +282,11 @@ class RealTimeArbitrageEngineCore:
         last = self._event_log_throttle_ts.get(key, 0.0)
         if now - last >= gap:
             self._event_log_throttle_ts[key] = now
+            # 🌟 R8: 高基数 key (如分腿对账差额指纹) 会缓慢累积, 定期清理过期项
+            if len(self._event_log_throttle_ts) > 500:
+                _cutoff = now - 7200
+                self._event_log_throttle_ts = {
+                    k: v for k, v in self._event_log_throttle_ts.items() if v >= _cutoff}
             return True
         return False
 
@@ -323,6 +340,120 @@ class RealTimeArbitrageEngineCore:
                     "⚠️ 【Binance 断开】市场数据通道中断，已立即暂停开新仓"))
             except RuntimeError:
                 pass
+
+    def _binance_position_data_trusted(self) -> Tuple[bool, str]:
+        """Binance 持仓数据可信度门禁 (2026-06-11 幻影空仓事故修复)。
+
+        用于"空仓读数"是否可以作为破坏性动作 (断尾求生/状态清零) 依据的判断:
+        - WS 重建后 warmup 秒内的空仓读数不可信 (重连初期 REST 快照可能假空)
+        - 初始持仓快照失败时空仓读数不可信
+        仅约束"读到 0"的场景; 非零持仓读数不受此门禁影响。
+        """
+        ws = self.binance_ws
+        if ws is None:
+            return False, "ws_missing"
+        if not getattr(ws, 'position_snapshot_ok', False):
+            return False, "snapshot_not_ok"
+        warmup = float(getattr(self, '_bn_hedge_missing_warmup_sec', 120.0))
+        ready_at = max(
+            float(getattr(ws, 'user_data_ready_at', 0.0) or 0.0),
+            float(getattr(ws, 'position_snapshot_at', 0.0) or 0.0))
+        if ready_at <= 0:
+            return False, "ready_ts_missing"
+        age = time.time() - ready_at
+        if age < warmup:
+            return False, f"warmup:{age:.0f}s/{warmup:.0f}s"
+        return True, "ok"
+
+    def _combo_close_in_flight(self, state) -> bool:
+        """该组合的 Binance 平仓是否在途 (CR-4: 在途平仓期间对账不得覆写 tracked 数量,
+        否则慢 REST 读数会把已被分片成交扣减的 binance_filled_qty 回灌成旧值)。"""
+        try:
+            _t = getattr(state, '_settlement_twap_task', None)
+            if _t is not None and not _t.done():
+                return True
+            _lk = self._combo_closing_locks.get(getattr(state, 'expiry_strike', None))
+            if _lk is not None and _lk.locked():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _bn_zero_reading_human_ack_active(self) -> bool:
+        """操作员通过 /start 解除"Binance持仓数据可疑"后 15 分钟内, 空仓读数视为人工已确认。
+
+        防死锁通道: 对冲真在引擎离线期间被外部平掉 (无归零推送、非系统平仓) 时,
+        因果证据永远无法出现; 操作员核实交易所实仓后 /start 即放行清零/断尾。
+        窗口 15 分钟 (RISK-5: 防惯性 /start 长时间敞开全门禁放行)。
+        """
+        return (time.time() - float(getattr(self, '_bn_suspect_human_ack_ts', 0.0) or 0.0)) < 900.0
+
+    def _binance_hedge_close_evidence(self, state) -> Tuple[bool, bool]:
+        """组合对冲腿"真的被平掉"的因果证据对 (2026-06-11 幻影空仓事故修复)。
+
+        Returns:
+            (self_closed, exchange_evidence)
+            self_closed: 系统自己发起过该对冲的平仓 (close_order_id / TWAP / 关闭时间戳)
+            exchange_evidence: 交易所在组合建仓后主动推送过该分腿归零事件
+                (强平/ADL/外部手动平仓都会触发 ACCOUNT_UPDATE 推送)
+        两者皆 False 时, "实仓为0"的读数与因果矛盾, 应按疑似数据故障处理。
+        """
+        # 🌟 F11 修复: _settlement_twap_started 是"平仓意图"(启动即置位)而非"平仓证据";
+        # 必须有实际成交才算系统自己平过仓。
+        # 🌟 CR-2 修复: 证据数量感知 — 平掉 1 个分片(10%)不得永久授权对剩余 90% 的清零/断尾:
+        #   强证据: 关闭完成时间戳(G4-01: 仅全部平完才置位) 或 TWAP实际成交覆盖开仓量≥90%
+        #   中证据: 有平仓订单ID 且 真实成交台账(binance_closed_qty_total)覆盖开仓量≥90%
+        #   (R4-2: 台账只由真实成交累加, 脱离对 binance_filled_qty 被污染值的自引用)
+        _open_ref = max(
+            Decimal(str(getattr(state, 'binance_open_qty', 0) or 0)),
+            Decimal(str(getattr(state, 'entry_amount', 0) or 0)))
+        _twap_filled_qty = Decimal('0')
+        try:
+            _twap_acc = getattr(state, '_settlement_twap_accumulated', None) or {}
+            _twap_filled_qty = Decimal(str(_twap_acc.get('filled', 0) or 0))
+        except Exception:
+            _twap_filled_qty = Decimal('0')
+        _twap_covers = _open_ref > 0 and _twap_filled_qty >= _open_ref * Decimal('0.9')
+        _closed_ledger = Decimal(str(getattr(state, 'binance_closed_qty_total', 0) or 0))
+        _ledger_covers = _open_ref > 0 and _closed_ledger >= _open_ref * Decimal('0.9')
+        _self_closed = (
+            float(getattr(state, '_hedge_close_completed_ts', 0.0) or 0.0) > 0
+            or _twap_covers
+            or (bool(getattr(state, 'binance_close_order_id', '')) and _ledger_covers))
+        _zero_evt_ts = 0.0
+        ws = self.binance_ws
+        _symbol = getattr(state, 'binance_future_symbol', '') or ''
+        if ws is not None and _symbol:
+            _evt_map = getattr(ws, 'position_zero_events', {}) or {}
+            _ps = (getattr(state, 'binance_position_side', '') or '').upper()
+            # 🌟 RISK-3 修复: 双向模式下 position_side 缺失时按策略方向推导,
+            # 防止反向分腿的归零事件被误认为本组合的证据
+            if _ps not in ('LONG', 'SHORT') and getattr(self, 'binance_dual_side_mode', False):
+                _ps = ('LONG' if getattr(state, 'strategy_type', '') == 'buy_future_sell_synthetic'
+                       else 'SHORT')
+            if _ps in ('LONG', 'SHORT'):
+                _keys = [(_symbol, _ps)]
+            else:
+                # 🌟 ARCH-03 修复: 单向模式下净额归零事件在多空组合并存时不代表
+                # 本组合的对冲被平 (净额穿越0是真实推送但语义无关), 不可作为证据
+                _active_dirs = set()
+                try:
+                    for _os in self.arbitrage_states.values():
+                        if (_os.state in ('position_open', 'executing', 'exiting')
+                                and getattr(_os, 'binance_future_symbol', '') == _symbol):
+                            _active_dirs.add(
+                                'LONG' if getattr(_os, 'strategy_type', '') == 'buy_future_sell_synthetic'
+                                else 'SHORT')
+                except Exception:
+                    _active_dirs = {'LONG', 'SHORT'}
+                if len(_active_dirs) > 1:
+                    _keys = []
+                else:
+                    _keys = [(_symbol, 'LONG'), (_symbol, 'SHORT'), (_symbol, 'BOTH')]
+            for _k in _keys:
+                _zero_evt_ts = max(_zero_evt_ts, float(_evt_map.get(_k, 0.0) or 0.0))
+        _exchange_evidence = _zero_evt_ts > float(getattr(state, 'start_time', 0.0) or 0.0)
+        return _self_closed, _exchange_evidence
 
     def _binance_market_ready(
             self, symbol: str, max_age_sec: float = 5.0,

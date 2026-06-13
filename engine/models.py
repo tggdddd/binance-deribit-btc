@@ -122,6 +122,9 @@ class Order:
     timestamp: float
     filled_amount: Decimal = Decimal('0')
     average_price: Decimal = Decimal('0')
+    # 🌟 2026-06-11: reduce_only 标志透传 (close_position 创建的订单在交易所侧无 label,
+    # 进程重启后只能靠此标志识别"在途平仓单", 防止 invalid_reduce_only_order 死循环)
+    reduce_only: bool = False
 
 
 @dataclass
@@ -158,6 +161,8 @@ class ArbitrageState:
     binance_entry_price: Decimal = Decimal('0')  # Binance 期货实际成交均价 (USDT)
     binance_open_qty: Decimal = Decimal('0')     # Binance 对冲开仓成交数量快照（用于结算开仓费口径）
     binance_filled_qty: Decimal = Decimal('0')   # Binance 期货实际成交数量 (BTC)
+    # 🌟 R4-2: 累计真实平仓成交量 (CR-2 中证据依据, 只由真实成交累加, 不被对账写污染)
+    binance_closed_qty_total: Decimal = Decimal('0')
     accumulated_funding: Decimal = Decimal('0')  # 永续合约累计 funding 费用 (USDT)
     last_exit_check_ts: float = 0.0  # 平仓风控检查节流时间戳（与 last_update 解耦）
     # 🌟 P1-17 回归修复: 期权订单 ID 必须 dataclass 字段 + 序列化, 否则重启后丢失

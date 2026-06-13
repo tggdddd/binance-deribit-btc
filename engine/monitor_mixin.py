@@ -171,17 +171,65 @@ class MonitorMixin:
 
                 _tracked_total = sum((_st.binance_filled_qty for _, _st in _items), Decimal('0'))
                 if abs(_tracked_total - _actual_qty) > _dust:
+                    # 🌟 2026-06-11 修复: 清零修正门禁 — 残余巡检自愈正是幻影空仓事故中
+                    # 批量清零 4 个组合状态机的"侧门", 与逐组合对账同样需要可信+因果证据
+                    _is_zero_corr = (_actual_qty <= _dust and _tracked_total > _dust)
+                    if _is_zero_corr:
+                        _trusted_rz, _why_rz = self._binance_position_data_trusted()
+                        _all_evidence = True
+                        for _es_z, _st_z in _items:
+                            _sc_z, _ev_z = self._binance_hedge_close_evidence(_st_z)
+                            if not (_sc_z or _ev_z):
+                                _all_evidence = False
+                                break
+                        # 人工确认短路全部门禁 (RISK-1b)
+                        _ack_rz = self._bn_zero_reading_human_ack_active()
+                        if not (_ack_rz or (_trusted_rz and _all_evidence)):
+                            if self._should_emit_throttled(
+                                    f"residual_zero_blocked:{_sym}:{_ps}", 60):
+                                logger.warning(
+                                    f"[Binance残余巡检] {_sym} {_ps or 'BOTH'} 实仓读数为0 "
+                                    f"(tracked_total={_tracked_total}), 但缺少可信/因果证据 "
+                                    f"(trusted={_trusted_rz}:{_why_rz}, all_evidence={_all_evidence}), "
+                                    f"跳过状态机清零")
+                            _issues.append(f"{_sym} {_ps or 'BOTH'}:zero_reading_untrusted")
+                            continue
                     # 仅在单组合时可直接覆写；多组合共享同分腿时按权重重标定，避免"总仓位重复写入每个组合"
                     if len(_items) == 1:
                         _es, _st = _items[0]
-                        logger.warning(
-                            f"[{_es[0]}-{_es[1]}] Binance残余巡检: 同步状态机数量 "
-                            f"{_st.binance_filled_qty} -> {_actual_qty}")
-                        _st.binance_filled_qty = max(_actual_qty, Decimal('0'))
-                        if self.binance_dual_side_mode and _actual_side in ("LONG", "SHORT"):
-                            _st.binance_position_side = _actual_side
-                        _st.last_update = time.time()
-                        await self._save_state_to_redis(_st)
+                        # 🌟 CR-4 (G4-03 修正: 仅跳过覆写, 不跳过组级 expect_hedge 评估)
+                        _skip_heal_write = self._combo_close_in_flight(_st)
+                        # 🌟 F3 修复: 与逐组合对账路径一致, 向上修正按 entry_amount 封顶
+                        # (否则此处 5 秒一轮的自愈会覆盖对账路径的封顶修复)
+                        _heal_qty = max(_actual_qty, Decimal('0'))
+                        _heal_cap = getattr(_st, 'entry_amount', Decimal('0')) or Decimal('0')
+                        if _heal_cap > 0 and _heal_qty > _heal_cap:
+                            if self._should_emit_throttled(
+                                    f"residual_upcap:{_es[0]}-{_es[1]}", 60):
+                                logger.warning(
+                                    f"[{_es[0]}-{_es[1]}] Binance残余巡检: 实仓 {_heal_qty} 超过组合开仓量 "
+                                    f"{_heal_cap} (疑似含已退出组合残仓), 按 {_heal_cap} 封顶")
+                            _heal_qty = _heal_cap
+                        # 🌟 R4-4: 非零向下修正需可信门禁 (防伪造中证据成立条件)
+                        if (not _skip_heal_write and _heal_qty > _dust
+                                and _heal_qty < _st.binance_filled_qty):
+                            _trusted_hd, _why_hd = self._binance_position_data_trusted()
+                            if not (_trusted_hd or self._bn_zero_reading_human_ack_active()):
+                                if self._should_emit_throttled(
+                                        f"residual_down_blocked:{_es[0]}-{_es[1]}", 60):
+                                    logger.warning(
+                                        f"[{_es[0]}-{_es[1]}] Binance残余巡检: 向下修正 "
+                                        f"{_st.binance_filled_qty} -> {_heal_qty} 被可信门禁延后 ({_why_hd})")
+                                _skip_heal_write = True
+                        if not _skip_heal_write and _st.binance_filled_qty != _heal_qty:
+                            logger.warning(
+                                f"[{_es[0]}-{_es[1]}] Binance残余巡检: 同步状态机数量 "
+                                f"{_st.binance_filled_qty} -> {_heal_qty}")
+                            _st.binance_filled_qty = _heal_qty
+                            if self.binance_dual_side_mode and _actual_side in ("LONG", "SHORT"):
+                                _st.binance_position_side = _actual_side
+                            _st.last_update = time.time()
+                            await self._save_state_to_redis(_st)
                     else:
                         _weights = []
                         _w_sum = Decimal('0')
@@ -200,6 +248,23 @@ class MonitorMixin:
                                 _allocated += _new_qty
                             else:
                                 _new_qty = max(_actual_qty - _allocated, Decimal('0'))
+                            # 🌟 F3 修复: 单组合分摊量同样按 entry_amount 封顶
+                            _alloc_cap = getattr(_st, 'entry_amount', Decimal('0')) or Decimal('0')
+                            if _alloc_cap > 0 and _new_qty > _alloc_cap:
+                                _new_qty = _alloc_cap
+                            # 🌟 CR-4: 平仓在途的组合跳过分摊覆写
+                            if self._combo_close_in_flight(_st):
+                                continue
+                            # 🌟 R4-4: 非零向下分摊需可信门禁 (防伪造中证据成立条件)
+                            if _new_qty > _dust and _new_qty < _st.binance_filled_qty:
+                                _trusted_ad, _why_ad = self._binance_position_data_trusted()
+                                if not (_trusted_ad or self._bn_zero_reading_human_ack_active()):
+                                    if self._should_emit_throttled(
+                                            f"alloc_down_blocked:{_es[0]}-{_es[1]}", 60):
+                                        logger.warning(
+                                            f"[{_es[0]}-{_es[1]}] Binance残余巡检: 分摊向下修正 "
+                                            f"{_st.binance_filled_qty} -> {_new_qty} 被可信门禁延后 ({_why_ad})")
+                                    continue
                             if abs(_st.binance_filled_qty - _new_qty) > _dust:
                                 _st.binance_filled_qty = _new_qty
                                 _st.last_update = time.time()
@@ -224,13 +289,16 @@ class MonitorMixin:
                         _issues.append(f"{_es[0]}-{_es[1]}:expect_hedge_missing")
 
             # 2) 额外校验：是否存在 Binance 未跟踪实仓（状态机之外）
+            # 🌟 RC-4 修复: 判定阈值与自动减损/幽灵检测的可执行阈值 (0.001) 对齐 —
+            # 否则 (0.0001, 0.001] 死区内的差额会永久挂起 "Binance残余仓位" 暂停而无人能处置
+            _actionable = Decimal('0.001')
             if self.binance_ws and self.binance_dual_side_mode and getattr(self.binance_ws, "positions_by_side", None):
                 _tracked_side = self._build_tracked_binance_by_side()
                 for (_bn_sym, _ps), _bn_pos in self.binance_ws.positions_by_side.items():
                     if _bn_pos.quantity <= _dust:
                         continue
                     _tracked_qty = _tracked_side.get((_bn_sym, _ps), Decimal('0'))
-                    if (_bn_pos.quantity - _tracked_qty) > _dust:
+                    if (_bn_pos.quantity - _tracked_qty) > _actionable:
                         _issues.append(f"{_bn_sym} {_ps}:untracked={_bn_pos.quantity - _tracked_qty}")
             elif self.binance_ws and getattr(self.binance_ws, "positions", None):
                 _tracked_signed = self._build_tracked_binance_signed()
@@ -239,7 +307,7 @@ class MonitorMixin:
                         continue
                     _actual_signed = _bn_pos.quantity if _bn_pos.side == "LONG" else -_bn_pos.quantity
                     _tracked_signed_qty = _tracked_signed.get(_bn_sym, Decimal('0'))
-                    if abs(_actual_signed - _tracked_signed_qty) > _dust:
+                    if abs(_actual_signed - _tracked_signed_qty) > _actionable:
                         _issues.append(f"{_bn_sym}:actual={_actual_signed},tracked={_tracked_signed_qty}")
 
             if _issues:
@@ -712,7 +780,10 @@ class MonitorMixin:
                 _query_ps = state.binance_position_side if self.binance_dual_side_mode else ''
                 _bn_actual_qty, _bn_actual_side, _, _bn_actual_known = await self._get_binance_actual_position(
                     state.binance_future_symbol, _query_ps)
-                if _bn_actual_known and abs(state.binance_filled_qty - _bn_actual_qty) > _dust:
+                if (_bn_actual_known and abs(state.binance_filled_qty - _bn_actual_qty) > _dust
+                        and not self._combo_close_in_flight(state)):
+                    # 🌟 CR-4: 平仓在途 (TWAP任务运行中/closing锁被持有) 时跳过覆写 —
+                    # 慢 REST 读数会把分片成交已扣减的数量回灌成旧值
                     # 关键防护：同 symbol+同 side 可能对应多个组合，Binance 返回的是"分腿总仓位"而非单组合仓位
                     # 仅在该分腿只被单个组合引用时，才允许按实仓覆写，避免把总仓位重复写入每个组合。
                     _share_cnt = 0
@@ -730,13 +801,67 @@ class MonitorMixin:
                         _share_cnt += 1
 
                     if _share_cnt <= 1:
-                        logger.warning(
-                            f"[{expiry}-{strike}] Binance 持仓对账修正: 状态机={state.binance_filled_qty} -> 实仓={_bn_actual_qty}")
-                        state.binance_filled_qty = _bn_actual_qty
-                        if self.binance_dual_side_mode and _bn_actual_side in ("LONG", "SHORT"):
-                            state.binance_position_side = _bn_actual_side
-                        state.last_update = time.time()
-                        await self._save_state_to_redis(state)
+                        # 🌟 2026-06-11 修复①: 清零修正是破坏性写 (解锁断尾/跳过平仓并固化进 Redis),
+                        # 需要可信门禁 + 因果证据; 缺证据时仅观察不覆写 (幻影空仓事故根因之一)
+                        _is_zero_correction = (
+                            state.binance_filled_qty > _dust and _bn_actual_qty <= _dust)
+                        if _is_zero_correction:
+                            _trusted_z, _trust_why_z = self._binance_position_data_trusted()
+                            _self_closed_z, _evidence_z = self._binance_hedge_close_evidence(state)
+                            # 人工确认短路全部门禁 (RISK-1b: 快照持续失败时人工通道不可被 trusted 卡死)
+                            _ack_z = self._bn_zero_reading_human_ack_active()
+                            if not (_ack_z or (_trusted_z and (_self_closed_z or _evidence_z))):
+                                if self._should_emit_throttled(
+                                        f"recon_zero_blocked:{expiry}-{strike}", 60):
+                                    logger.warning(
+                                        f"[{expiry}-{strike}] Binance 对账读到清零 "
+                                        f"(状态机={state.binance_filled_qty} -> 0), 但缺少可信/因果证据 "
+                                        f"(trusted={_trusted_z}:{_trust_why_z}, self_closed={_self_closed_z}, "
+                                        f"zero_event={_evidence_z}), 仅观察不覆写")
+                                _bn_recon_skip_write = True
+                            else:
+                                _bn_recon_skip_write = False
+                        else:
+                            _bn_recon_skip_write = False
+
+                        # 🌟 2026-06-11 修复②: 向上修正不得超过组合自身的 entry_amount —
+                        # 同分腿的其他组合 exited 后其交易所残仓会让"实仓总量"虚高,
+                        # 直接写入会与 Redis 保存护栏互相打架 (16:00 事故 0.4→0.1 每秒刷屏)
+                        _write_qty = _bn_actual_qty
+                        _entry_cap = getattr(state, 'entry_amount', Decimal('0')) or Decimal('0')
+                        if _entry_cap > 0 and _write_qty > _entry_cap:
+                            if self._should_emit_throttled(
+                                    f"recon_upcap:{expiry}-{strike}", 60):
+                                logger.warning(
+                                    f"[{expiry}-{strike}] Binance 对账实仓 {_bn_actual_qty} 超过组合开仓量 "
+                                    f"{_entry_cap} (疑似含其他已退出组合的残仓), 按 {_entry_cap} 封顶写入; "
+                                    f"超额部分由幽灵/残余巡检处置")
+                            _write_qty = _entry_cap
+
+                        # 🌟 R4-4 修复: 非零向下修正同样需要可信门禁 — 假低读数会把 tracked
+                        # 压到 ≤10% 开仓量, 伪造 CR-2 中证据的成立条件 (R4-2 污染链入口)。
+                        # 预热期内向下修正仅观察; 向上/持平修正不受影响。
+                        if (not _bn_recon_skip_write
+                                and _write_qty > _dust
+                                and _write_qty < state.binance_filled_qty):
+                            _trusted_d, _why_d = self._binance_position_data_trusted()
+                            if not (_trusted_d or self._bn_zero_reading_human_ack_active()):
+                                if self._should_emit_throttled(
+                                        f"recon_down_blocked:{expiry}-{strike}", 60):
+                                    logger.warning(
+                                        f"[{expiry}-{strike}] Binance 对账向下修正 "
+                                        f"{state.binance_filled_qty} -> {_write_qty} 被可信门禁延后 "
+                                        f"({_why_d}), 仅观察")
+                                _bn_recon_skip_write = True
+
+                        if not _bn_recon_skip_write and state.binance_filled_qty != _write_qty:
+                            logger.warning(
+                                f"[{expiry}-{strike}] Binance 持仓对账修正: 状态机={state.binance_filled_qty} -> 实仓={_write_qty}")
+                            state.binance_filled_qty = _write_qty
+                            if self.binance_dual_side_mode and _bn_actual_side in ("LONG", "SHORT"):
+                                state.binance_position_side = _bn_actual_side
+                            state.last_update = time.time()
+                            await self._save_state_to_redis(state)
                     else:
                         logger.debug(
                             f"[{expiry}-{strike}] Binance 持仓对账仅做观察: "
@@ -779,31 +904,148 @@ class MonitorMixin:
                          and 0 < _hours_to_expiry_early <= _twap_window_hours))
             )
             if _expect_binance_hedge and _bn_actual_known and _bn_actual_qty <= _dust and not _twap_intentional_close:
+                # 🌟 2026-06-11 幻影空仓事故修复: 四层防御替代原"单源8秒宽限即断尾"
+                # 事故: Binance WS 重建后 REST 持续返回假空 2.6h, 9 秒后 5 个健康组合
+                # 的 Deribit 期权腿被全部误杀 (16:00 持仓"重现"证明数据是假的)。
                 _now_hm = time.time()
-                _grace = max(float(getattr(self, '_bn_hedge_missing_grace_sec', 8.0)), 2.0)
+
+                # ① 数据预热门禁: WS 重建后 warmup 内的空仓读数不可信, 不累积计时
+                # (人工确认窗口内豁免 — 操作员已核实交易所实仓, RISK-1b)
+                _trusted, _trust_why = self._binance_position_data_trusted()
+                if not _trusted and not self._bn_zero_reading_human_ack_active():
+                    state._bn_hedge_missing_since = 0.0
+                    state._bn_hedge_missing_confirms = 0
+                    # 🌟 ARCH-04 修复②: 可信门禁持续阻塞 >10 分钟时升级 (防止 trusted 恢复
+                    # 通道全部失效时 L1 永久静默冻结, 人工确认通道不可达)
+                    _blk_since = getattr(state, '_bn_hedge_check_blocked_since', 0.0)
+                    if _blk_since <= 0:
+                        state._bn_hedge_check_blocked_since = time.time()
+                    elif (time.time() - _blk_since) > 600:
+                        self._add_pause("Binance持仓数据可疑")
+                        self._bn_suspect_last_add_ts = time.time()
+                        if self._should_emit_throttled(
+                                f"hedge_blocked_escalate:{expiry}-{strike}", 600):
+                            logger.error(
+                                f"🚨 [{expiry}-{strike}] Binance 实仓读数为0且可信门禁阻塞超过10分钟 "
+                                f"({_trust_why}), 升级为持仓数据可疑暂停, 请人工核实")
+                            asyncio.create_task(tg_notifier.send_error_async(
+                                f"🚨 [{expiry}-{strike}] Binance 持仓核查阻塞超10分钟\n"
+                                f"原因: {_trust_why}\n已暂停开仓, 请人工核实实仓后 /start 确认。",
+                                "binance_hedge_blocked_escalate"))
+                    if self._should_emit_throttled(
+                            f"hedge_missing_warmup:{expiry}-{strike}", 60):
+                        logger.warning(
+                            f"⏸️ [{expiry}-{strike}] Binance 实仓读数为0, 但持仓数据未过可信门禁"
+                            f"({_trust_why}), 暂不计入对冲缺失")
+                    return
+                state._bn_hedge_check_blocked_since = 0.0
+
+                # ② 宽限期 (默认30s)
+                _grace = max(float(getattr(self, '_bn_hedge_missing_grace_sec', 30.0)), 2.0)
                 _first_seen = getattr(state, '_bn_hedge_missing_since', 0.0)
                 if _first_seen <= 0:
                     state._bn_hedge_missing_since = _now_hm
+                    state._bn_hedge_missing_confirms = 0
+                    state._bn_hedge_missing_last_confirm_ts = 0.0
                     return
                 if (_now_hm - _first_seen) < _grace:
                     return
 
+                # ③ 连续确认: ≥N 次 known=True 空读数, 每次间隔 ≥5s
+                # (unknown 读数走 else 分支冻结计数不清零; 仅 known 读数推进确认)
+                _last_confirm = getattr(state, '_bn_hedge_missing_last_confirm_ts', 0.0)
+                if (_now_hm - _last_confirm) >= 5.0:
+                    state._bn_hedge_missing_confirms = getattr(
+                        state, '_bn_hedge_missing_confirms', 0) + 1
+                    state._bn_hedge_missing_last_confirm_ts = _now_hm
+                _need_confirms = max(int(getattr(self, '_bn_hedge_missing_min_confirms', 3)), 1)
+                _cur_confirms = getattr(state, '_bn_hedge_missing_confirms', 0)
+                if _cur_confirms < _need_confirms:
+                    if self._should_emit_throttled(
+                            f"hedge_missing_confirm:{expiry}-{strike}", 30):
+                        logger.warning(
+                            f"⚠️ [{expiry}-{strike}] 对冲缺失候选 ({_cur_confirms}/{_need_confirms}), "
+                            f"等待连续确认 | tracked={state.binance_filled_qty}, actual={_bn_actual_qty}")
+                    return
+
+                # ④ 因果证据仲裁: 不可逆动作前必须有"持仓真的没了"的因果证据
+                # 证据A: 系统自己发过平仓 (close_order_id / TWAP / 关闭时间戳)
+                # 证据B: 交易所主动推送过归零事件 (强平/ADL/外部平仓都会推 ACCOUNT_UPDATE)
+                # 两者皆无 → 空读数与因果矛盾 = 疑似交易所数据故障 (本次事故场景),
+                # 任何时长的定时确认都防不住持续假空, 只能暂停+告警等人工/数据恢复。
+                _self_closed, _exchange_evidence = self._binance_hedge_close_evidence(state)
+                _human_ack = self._bn_zero_reading_human_ack_active()
+
+                if not (_self_closed or _exchange_evidence or _human_ack):
+                    self._add_pause("Binance持仓数据可疑")
+                    self._bn_suspect_last_add_ts = time.time()
+                    if self._should_emit_throttled(
+                            f"hedge_missing_suspect:{expiry}-{strike}", 300):
+                        logger.error(
+                            f"🚨 [{expiry}-{strike}] Binance 实仓读数为0, 但系统从未平过该对冲、"
+                            f"也无交易所归零事件 — 判定疑似持仓数据故障, 已暂停开仓, "
+                            f"不执行断尾 (tracked={state.binance_filled_qty})")
+                        asyncio.create_task(tg_notifier.send_error_async(
+                            f"🚨 [{expiry}-{strike}] Binance 持仓数据可疑\n"
+                            f"实仓读数为0但无任何平仓因果证据 (系统未平仓/无归零推送)。\n"
+                            f"已暂停开仓, 保留期权腿等待数据恢复。\n"
+                            f"请人工核实 Binance 实际持仓; 确认后可 /start 解除。",
+                            "binance_hedge_data_suspect"))
+                    return
+
+                # ⑤ 有因果证据 → 允许断尾求生 (原 30s 节流)
                 _last_trigger = getattr(state, '_bn_hedge_missing_trigger_ts', 0.0)
                 if (_now_hm - _last_trigger) >= 30:
                     state._bn_hedge_missing_trigger_ts = _now_hm
                     self._add_pause("Binance残余仓位")
+                    _evidence_src = (
+                        '系统已平仓' if _self_closed
+                        else ('交易所归零事件' if _exchange_evidence else '人工确认(/start)'))
                     logger.error(
                         f"🚨 [{expiry}-{strike}] 检测到裸腿: Deribit 期权在仓，但 Binance 对冲实仓为0。"
-                        f" tracked={state.binance_filled_qty}, actual={_bn_actual_qty}")
+                        f" tracked={state.binance_filled_qty}, actual={_bn_actual_qty} "
+                        f"(因果证据: {_evidence_src})")
                     asyncio.create_task(tg_notifier.send_error_async(
                         f"🚨 [{expiry}-{strike}] 对冲腿缺失\n"
                         f"Deribit 期权仍在仓，但 Binance {state.binance_future_symbol} 实仓为0\n"
                         f"系统将执行组合级紧急处置（断尾求生）。",
                         "binance_hedge_missing_combo"))
-                    await self._emergency_dump_all(state, combination, f_pos, c_pos, p_pos)
+                    await self._emergency_dump_all(
+                        state, combination, f_pos, c_pos, p_pos, reason='对冲腿缺失断尾')
                 return
             else:
-                state._bn_hedge_missing_since = 0.0
+                # 🌟 RISK-2 修复: known=False (查询失败) 时冻结计数而非清零 —
+                # 否则真实裸腿 + REST 间歇失败时, 每次失败读数都把宽限+确认全部归零,
+                # 断尾被无限推迟。仅 known 读数(实仓可见)/不再期望对冲 时才正常清零。
+                if not (_expect_binance_hedge and not _bn_actual_known):
+                    state._bn_hedge_missing_since = 0.0
+                    state._bn_hedge_missing_confirms = 0
+                    # L1 阻塞计时同步复位 — 否则陈旧计时会让下次进入 L1 时立即误升级
+                    state._bn_hedge_check_blocked_since = 0.0
+                elif self._should_emit_throttled(f"hedge_missing_unknown:{expiry}-{strike}", 60):
+                    logger.warning(
+                        f"⏸️ [{expiry}-{strike}] Binance 持仓查询失败(unknown), "
+                        f"对冲缺失计数冻结不清零 "
+                        f"(confirms={getattr(state, '_bn_hedge_missing_confirms', 0)})")
+                # 数据恢复 (期望对冲且实仓重新可见) → 自动解除"数据可疑"暂停
+                # 🌟 R1 修复: 多组合读数分歧时会乒乓震荡, 解除需最短持有 60s + 通知节流
+                # 🌟 R4-3: 解除还需 trusted 恢复 (L1 升级的 add 原因即 trusted 阻塞,
+                # 不得被对侧分腿的非零读数在基础设施故障未排除时误解除)
+                if (_expect_binance_hedge and _bn_actual_known and _bn_actual_qty > _dust
+                        and self._has_pause("Binance持仓数据可疑")
+                        and (time.time() - getattr(self, '_bn_suspect_last_add_ts', 0.0)) >= 60.0
+                        and self._binance_position_data_trusted()[0]):
+                    self._remove_pause("Binance持仓数据可疑")
+                    # 🌟 R4-1: 记录自动解除时刻 — /start 据此区分"数据已自证恢复"与
+                    # "暂停仍在/刚消失的竞态", 防止惯性 /start 误登记 15 分钟 ack
+                    self._bn_suspect_auto_resolved_ts = time.time()
+                    if self._should_emit_throttled("bn_suspect_auto_resolve", 60):
+                        logger.warning(
+                            f"✅ [{expiry}-{strike}] Binance 持仓数据已恢复 (实仓={_bn_actual_qty}), "
+                            f"自动解除 'Binance持仓数据可疑' 暂停")
+                        asyncio.create_task(tg_notifier.send_async(
+                            f"✅ [{expiry}-{strike}] Binance 持仓数据已恢复 (实仓={_bn_actual_qty})，"
+                            f"数据可疑暂停已自动解除"))
 
             if _is_cross_exchange:
                 if not _has_option_pair:
@@ -1273,7 +1515,9 @@ class MonitorMixin:
                                 f"未确认价仓位浮亏 {combo_pnl_usd:.2f} USD\n"
                                 f"连续 {_hs_cnt} 次确认，已强制市价强平"))
                         state._hard_stop_consecutive = 0
-                        await self._emergency_dump_all(state, combination, f_pos, c_pos, p_pos)
+                        await self._emergency_dump_all(
+                            state, combination, f_pos, c_pos, p_pos,
+                            reason='硬止损' if _is_confirmed_path else '极端护栏(未确认价2×)')
                         return
                 else:
                     if int(getattr(state, '_hard_stop_consecutive', 0)) > 0:
@@ -1318,7 +1562,8 @@ class MonitorMixin:
                         logger.error(
                             f"🚨🚨 [致命护栏触发] {expiry}-{strike} 净 Gamma敞口 ({net_gamma:.4f}) "
                             f"连续 {_cur_cnt} 次超标! 发生极端非线性偏离, 断尾求生!")
-                        await self._emergency_dump_all(state, combination, f_pos, c_pos, p_pos)
+                        await self._emergency_dump_all(
+                            state, combination, f_pos, c_pos, p_pos, reason='Gamma爆仓')
                         return
                 else:
                     state.gamma_exceed_start = 0
@@ -1343,7 +1588,9 @@ class MonitorMixin:
                         f"强制平仓止 funding 出血\n{_pnl_tag}"))
                     state.exit_reason = f'永续超时({_hold_hours:.0f}h)'
                     if not state.prices_confirmed:
-                        await self._emergency_dump_all(state, combination, f_pos, c_pos, p_pos)
+                        await self._emergency_dump_all(
+                            state, combination, f_pos, c_pos, p_pos,
+                            reason=f'永续超时({_hold_hours:.0f}h)')
                         return
                     _perpetual_timeout = True  # 标记: 跳过所有利润门槛，直接进入平仓执行
 

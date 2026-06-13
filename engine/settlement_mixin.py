@@ -116,15 +116,20 @@ class SettlementMixin:
                     logger.error(f"[结算规避] 恢复延后 /stop_all 失败: {e}")
 
     async def _emergency_dump_all(self, state: ArbitrageState, combination: Dict, f_pos: Position, c_pos: Position,
-                                  p_pos: Position):
-        """🚨 灾难强平：无视流动性与滑点成本，强制清空特定组合的所有仓位"""
+                                  p_pos: Position, reason: str = ''):
+        """🚨 灾难强平：无视流动性与滑点成本，强制清空特定组合的所有仓位
+
+        reason: 触发源 (硬止损/Gamma爆仓/对冲腿缺失断尾/破损组合/...), 落库为真实平仓原因。
+        2026-06-11 修复: 原落库硬编码'硬止损', 4 个触发源全部被错记, 审计失真。
+        """
         # 🌟 B 修复: 以 per-combo 锁包裹, 与 _handle_delivery_settlement 串行
         _closing_lock = self._get_closing_lock(state)
         async with _closing_lock:
-            return await self._emergency_dump_all_locked(state, combination, f_pos, c_pos, p_pos)
+            return await self._emergency_dump_all_locked(
+                state, combination, f_pos, c_pos, p_pos, reason=reason)
 
     async def _emergency_dump_all_locked(self, state: ArbitrageState, combination: Dict, f_pos: Position, c_pos: Position,
-                                          p_pos: Position):
+                                          p_pos: Position, reason: str = ''):
         """原 _emergency_dump_all 主体, 通过锁包裹后的内部实现"""
         if self._is_deribit_settlement_core_window():
             self._add_pause("结算窗口")
@@ -187,7 +192,9 @@ class SettlementMixin:
 
         # 0. 🌟 跨所: 先强平 Binance 对冲腿 (优先级最高，防止裸腿敞口)
         _bn_qty_snapshot = state.binance_filled_qty  # 保存快照，close 后会清零
-        _bn_entry_snapshot = state.binance_entry_price or Decimal('0')
+        # 🌟 2026-06-11 修复: binance_entry_price 可能因测试网 avgPrice=0 写入为 0,
+        # 兜底 entry_prices['future'] (镜像交割结算路径), 防止期货腿 PnL 整段被 >0 守卫跳过
+        _bn_entry_snapshot = state.binance_entry_price or state.entry_prices.get('future', Decimal('0')) or Decimal('0')
         _bn_dump_ok = False
         if state.binance_future_symbol and state.binance_filled_qty > 0:
             logger.error(f"{log_prefix} 正在强平 Binance 对冲: {state.binance_future_symbol} × {state.binance_filled_qty}")
@@ -204,7 +211,12 @@ class SettlementMixin:
                 # 🌟 P2 回归修复: 紧急强平也要保存 close_order_ids 供审计
                 self._capture_binance_close_ids(state, _bn_result)
                 # 🌟 2026-04-24: 打标对冲关闭时刻，供 '实际对冲关闭时间' 字段使用
-                state._hedge_close_completed_ts = time.time()
+                # 🌟 R4-6 修复: reconciled(对账清零, 零实际成交) 不是平仓完成, 不得铸造
+                # CR-2 强证据 — 否则一次误放行会被固化为跨重启的无条件断尾授权
+                if not _bn_result.get('reconciled'):
+                    state._hedge_close_completed_ts = time.time()
+                else:
+                    state._hedge_close_reconciled_ts = time.time()
                 logger.info(f"{log_prefix} ✅ Binance 对冲已强平: 均价={_bn_result.get('avgPrice', '?')}")
             elif _bn_result:
                 # 部分成交: 保留 close IDs 但视作未完成, 不平 Deribit 防裸腿
@@ -361,6 +373,30 @@ class SettlementMixin:
             _em_c_exit = _extract_fill_price(c_result)
             _em_p_exit = _extract_fill_price(p_result)
 
+            # 🌟 2026-06-11 修复: 期货平仓价缺失的两种情形必须区分 (事故: -7.04 实为纯手续费,
+            # 期货腿 ~-$139 因 avgPrice=0 被 >0 守卫静默丢弃, 日损基准失真):
+            # ① reconciled=True (对账清零) → 实际没发生平仓成交, 期货腿不得估算盈亏, 仅打标
+            # ② 真实平仓但 avgPrice 缺失 → 用参考价估算并打标, 不再静默丢弃整条腿
+            _em_bn_reconciled = bool(_bn_result.get('reconciled')) if _bn_result else False
+            # 🌟 API-2 修复: 回填链兜底到标记价时 avgPrice>0, 须消费 avgPriceSource/state 标记
+            _em_f_exit_estimated = bool(
+                (_bn_result and _bn_result.get('avgPriceSource') == 'mark_fallback')
+                or getattr(state, '_bn_close_price_estimated', False))
+            if (_bn_dump_ok and _bn_result and not _em_bn_reconciled
+                    and _em_f_exit <= 0 and _bn_qty_snapshot > 0):
+                try:
+                    _em_est_px = await self._get_reference_btc_price(state.binance_future_symbol)
+                except Exception:
+                    _em_est_px = Decimal('0')
+                if _em_est_px > 0:
+                    _em_f_exit = _em_est_px
+                    _em_f_exit_estimated = True
+                    logger.warning(
+                        f"{log_prefix} Binance 平仓均价缺失, 以参考价 {_em_est_px} 估算期货腿盈亏 (已打标)")
+            elif _em_bn_reconciled and _bn_qty_snapshot > 0:
+                logger.warning(
+                    f"{log_prefix} Binance 对冲为对账清零 (无平仓成交), 期货腿盈亏不计入本记录")
+
             # 估算 P&L
             _em_pnl = 0.0
             _em_fee = 0.0
@@ -437,7 +473,14 @@ class SettlementMixin:
                 'Call_ID': getattr(state, 'call_order_id', '') or 'UNCONFIRMED',
                 'Put_ID': getattr(state, 'put_order_id', '') or 'UNCONFIRMED',
                 'Future_ID': self._format_future_id(state),
-                '交易类型': '紧急强平', '平仓原因': '硬止损',
+                # 🌟 2026-06-11 修复: 落库真实触发源 (原硬编码'硬止损'导致裸腿断尾/Gamma爆仓/
+                # 破损组合全部被错记); 默认值'紧急强平(未标注)'用于暴露漏传 reason 的调用点
+                '交易类型': '紧急强平',
+                '平仓原因': (
+                    (reason or getattr(state, 'exit_reason', '') or '紧急强平(未标注)')
+                    + ('(期货价为估算)' if _em_f_exit_estimated else '')
+                    + ('(期货腿对账清零无成交)' if (_em_bn_reconciled and _bn_qty_snapshot > 0) else '')
+                    + ('(入场价为估算)' if getattr(state, '_bn_entry_price_estimated', False) else '')),
                 # 紧急强平是同步关闭，写入时间 ≈ 对冲关闭时间
                 '实际对冲关闭时间': time.strftime(
                     '%Y-%m-%d %H:%M:%S',
@@ -477,7 +520,14 @@ class SettlementMixin:
             asyncio.create_task(self._try_auto_resume_after_delivery(log_prefix))
 
     def _find_active_deribit_close_order(self, instrument_name: str) -> Optional[Order]:
-        """Return an in-flight emergency/cleanup close order for this instrument, if any."""
+        """Return an in-flight emergency/cleanup close order for this instrument, if any.
+
+        🌟 2026-06-11 修复: label OR reduce_only 双通道识别。
+        close_position 创建的订单在交易所侧无 label (API 不支持), 本地补的 'em_close'
+        label 在 WS 重连 get_open_orders 重建或进程重启后会丢失 (本次事故: label 被
+        空值覆盖 → 失配 → 盲发 IOC → invalid_reduce_only_order 死循环 2.5h/359次)。
+        reduce_only 标志由交易所返回, 跨重连/重启稳定, 作为第二识别通道。
+        """
         terminal = {'filled', 'cancelled', 'rejected'}
         close_prefixes = ('em_', 'ghost_', 'l2a_', 'l2t_', 'l2f_')
         for order in list(getattr(self.client, 'active_orders', {}).values()):
@@ -488,6 +538,8 @@ class SettlementMixin:
                     continue
                 label = str(order.label or '').lower()
                 if label.startswith(close_prefixes) or label in ('em_close', 'em_opt'):
+                    return order
+                if getattr(order, 'reduce_only', False):
                     return order
             except Exception:
                 continue
@@ -551,6 +603,70 @@ class SettlementMixin:
                             return self._synthetic_closed_order(instrument_name)
                     else:
                         return None
+
+                    # 🌟 2026-06-11 修复: 本地缓存失配时, 用交易所权威查询找出阻塞 reduce-only
+                    # 的在途挂单 (事故根因: label 丢失 → 本地找不到 → 盲发 IOC 又被拒, 死循环)。
+                    # 查询失败 → 保持未完成等下轮, 绝不落入 IOC 盲发。
+                    try:
+                        _oo_resp = await self.client.send_request({
+                            "jsonrpc": "2.0",
+                            "id": self.client._get_next_request_id(),
+                            "method": "private/get_open_orders_by_instrument",
+                            "params": {"instrument_name": instrument_name}
+                        }, is_private=True)
+                    except Exception as _oo_err:
+                        logger.warning(
+                            f"{log_prefix} {instrument_name} 权威挂单查询异常: {_oo_err}, "
+                            f"保持未完成状态等待下轮")
+                        return None
+                    if not isinstance(_oo_resp, dict) or 'error' in _oo_resp:
+                        logger.warning(
+                            f"{log_prefix} {instrument_name} 权威挂单查询失败: "
+                            f"{_oo_resp.get('error') if isinstance(_oo_resp, dict) else _oo_resp}, "
+                            f"保持未完成状态等待下轮")
+                        return None
+                    _open_items = _oo_resp.get('result') or []
+                    _adopted = None
+                    for _oo_item in _open_items:
+                        try:
+                            _oo_id = _oo_item.get('order_id') or ''
+                            _oo_order = self.client._order_from_api_data(
+                                _oo_item, existing=self.client.active_orders.get(_oo_id))
+                            _oo_label = str(_oo_order.label or '').lower()
+                            _is_close_like = (
+                                getattr(_oo_order, 'reduce_only', False)
+                                or _oo_label.startswith(('em_', 'ghost_', 'l2a_', 'l2t_', 'l2f_')))
+                            if _is_close_like:
+                                # 认领: 补 label 入本地缓存, 下轮由本地通道直接命中
+                                if not _oo_order.label:
+                                    _oo_order.label = 'em_close'
+                                self.client._store_order_snapshot(_oo_order)
+                                if _adopted is None:
+                                    _adopted = _oo_order
+                            else:
+                                # 非平仓类挂单同样会阻塞 reduce-only: 撤掉后下轮重发 close_position
+                                logger.warning(
+                                    f"{log_prefix} {instrument_name} 存在阻塞 reduce-only 的"
+                                    f"非平仓挂单 {_oo_id} (label={_oo_order.label!r}), 撤单后下轮重试")
+                                try:
+                                    await self.client.cancel_order(_oo_id)
+                                except Exception as _co_err:
+                                    logger.warning(f"{log_prefix} 撤阻塞挂单失败: {_co_err}")
+                        except Exception as _oo_parse_err:
+                            logger.warning(f"{log_prefix} 解析权威挂单失败: {_oo_parse_err}")
+                    if _adopted is not None:
+                        if self._should_emit_throttled(
+                                f"close_position_adopted:{instrument_name}", 60):
+                            logger.warning(
+                                f"{log_prefix} {instrument_name} 权威查询认领在途平仓挂单 "
+                                f"{_adopted.order_id} (reduce_only={getattr(_adopted, 'reduce_only', False)}), "
+                                f"等待其成交")
+                        return _adopted
+                    # 无任何在途挂单但仓位仍在 → 拒因不明, 下轮重试 close_position (不盲发 IOC)
+                    logger.warning(
+                        f"{log_prefix} {instrument_name} invalid_reduce_only_order 但权威查询无在途挂单, "
+                        f"下轮重试 close_position")
+                    return None
                 # 降级方案：用交易所允许范围内的极端价 IOC 限价单，确保立即成交
                 ticker = self.client.tickers.get(instrument_name)
                 pos = self.client.positions.get(instrument_name)
@@ -630,8 +746,25 @@ class SettlementMixin:
                 logger.warning(f"[Binance平仓对账] 无法确认交易所真实持仓({_symbol})，保留状态等待重试")
                 return None
             if _actual_total_qty <= _dust:
+                # 🌟 2026-06-11 修复: 自动清零是破坏性写 (上层会据此跳过真实平仓并记账),
+                # 幻影空仓事故中两个组合在此被"假强平"(均价=0, 实仓其实还在)。
+                # 必须有可信门禁 + 因果证据才允许清零, 否则保留状态等待数据恢复。
+                _trusted_cz, _why_cz = self._binance_position_data_trusted()
+                _self_closed_cz, _evidence_cz = self._binance_hedge_close_evidence(state)
+                # 人工确认短路全部门禁 (RISK-1b: 快照持续失败时人工通道不可被 trusted 卡死)
+                _ack_cz = self._bn_zero_reading_human_ack_active()
+                if not (_ack_cz or (_trusted_cz and (_self_closed_cz or _evidence_cz))):
+                    if self._should_emit_throttled(
+                            f"hedge_close_zero_blocked:{_symbol}:{state.expiry_strike}", 60):
+                        logger.warning(
+                            f"[Binance平仓对账] {_symbol} 实仓读数为0 (状态机 qty={_combo_qty}), "
+                            f"但缺少可信/因果证据 (trusted={_trusted_cz}:{_why_cz}, "
+                            f"self_closed={_self_closed_cz}, zero_event={_evidence_cz}), "
+                            f"保留状态等待重试")
+                    return None
                 logger.warning(
-                    f"[Binance平仓对账] 状态机记录 {_symbol} qty={_combo_qty}，但交易所实际为0，自动清零该组合")
+                    f"[Binance平仓对账] 状态机记录 {_symbol} qty={_combo_qty}，但交易所实际为0，自动清零该组合 "
+                    f"(因果证据: self_closed={_self_closed_cz}, zero_event={_evidence_cz})")
                 state.binance_filled_qty = Decimal('0')
                 return {'status': 'FILLED', 'avgPrice': '0', 'executedQty': '0', 'reconciled': True}
 
@@ -720,6 +853,11 @@ class SettlementMixin:
                 _filled = Decimal(str(_result.get('executedQty', '0'))) if _result else Decimal('0')
                 if _filled <= 0 and _result and _result.get('status') == 'FILLED':
                     _filled = _request_qty
+                if _filled > 0:
+                    # 🌟 R4-2: 真实成交台账 — CR-2 中证据的可审计依据,
+                    # 脱离对 binance_filled_qty (可能被对账写污染) 的自引用
+                    state.binance_closed_qty_total = Decimal(str(
+                        getattr(state, 'binance_closed_qty_total', 0) or 0)) + _filled
                 state.binance_filled_qty = max(state.binance_filled_qty - _filled, Decimal('0'))
                 if state.binance_filled_qty <= _dust:
                     state.binance_filled_qty = Decimal('0')
@@ -727,6 +865,9 @@ class SettlementMixin:
 
             def _record_twap_fill(_result: dict, _request_qty: Decimal, _src: str) -> Decimal:
                 nonlocal _twap_filled_total, _twap_notional_total, _twap_priced_filled_total, _twap_order_count, _twap_last_avg
+                # 🌟 API-2 修复: 分片均价是标记价兜底估算时, 打标到 state 供 PnL/落库识别
+                if isinstance(_result, dict) and _result.get('avgPriceSource') == 'mark_fallback':
+                    state._bn_close_price_estimated = True
                 _filled = _apply_combo_fill(_result, _request_qty)
                 _raw_avg = _decimal_or_zero(_result.get('avgPrice')) if isinstance(_result, dict) else Decimal('0')
                 _avg = _extract_binance_fill_avg(_result, _filled, _twap_last_avg)
@@ -828,9 +969,36 @@ class SettlementMixin:
                 _actual_total_qty, _, _, _actual_known = await self._get_binance_actual_position(
                     _symbol, _position_side)
                 if not _actual_known:
+                    # 🌟 L4-02: 早退前先捕获本轮已成交分片的 orderIds (审计链不因重试丢失)
+                    if _twap_filled_total > 0:
+                        self._capture_binance_close_ids(state, {
+                            'orderIds': list(_twap_order_ids),
+                            'status': 'PARTIALLY_FILLED',
+                        })
                     logger.warning(f"[Binance REST 降级] 无法确认交易所真实持仓({_symbol})，保留状态等待重试")
                     return None
                 if _actual_total_qty <= _dust:
+                    # 🌟 ARCH-01 修复: 同函数第二处清零写, 与入口门禁同款防护 —
+                    # TOCTOU 窗口: 入口读数正常→executor分片被拒转REST降级→此刻读到假空。
+                    # 注: 部分成交不构成充分证据 (中证据需台账覆盖≥90%开仓量),
+                    # 缺证据时按 fail-safe 保留状态重试, 真零场景由证据积累/人工 /start 解锁。
+                    _trusted_b, _why_b = self._binance_position_data_trusted()
+                    _self_closed_b, _evidence_b = self._binance_hedge_close_evidence(state)
+                    _ack_b = self._bn_zero_reading_human_ack_active()
+                    if not (_ack_b or (_trusted_b and (_self_closed_b or _evidence_b))):
+                        # 🌟 L4-02: 拦截前捕获已成交分片 orderIds, 防 P2-1 审计链被门禁重新打断
+                        if _twap_filled_total > 0:
+                            self._capture_binance_close_ids(state, {
+                                'orderIds': list(_twap_order_ids),
+                                'status': 'PARTIALLY_FILLED',
+                            })
+                        if self._should_emit_throttled(
+                                f"rest_fallback_zero_blocked:{_symbol}:{state.expiry_strike}", 60):
+                            logger.warning(
+                                f"[Binance REST 降级] {_symbol} 实仓读数为0但缺少可信/因果证据 "
+                                f"(trusted={_trusted_b}:{_why_b}, self_closed={_self_closed_b}, "
+                                f"zero_event={_evidence_b}), 保留状态等待重试")
+                        return None
                     state.binance_filled_qty = Decimal('0')
                     logger.info(f"✅ Binance 交易所仓位已为0，自动清除组合残量: {_symbol}")
                     _twap_result = _build_twap_result('FILLED')
@@ -883,6 +1051,34 @@ class SettlementMixin:
                                 logger.info(f"[Binance平仓TWAP/REST] ✅ 查单恢复: status={result.get('status')}")
                         _status = result.get('status', 'unknown') if result else 'no_response'
                         if result and _status in ('FILLED', 'PARTIALLY_FILLED'):
+                            # 🌟 2026-06-11 修复: REST 降级路径绕过 executor 的均价回填,
+                            # 此处补一次查单回填 (测试网 FILLED 响应常 avgPrice=0 污染 VWAP/PnL)
+                            try:
+                                _r_avg = Decimal(str(result.get('avgPrice', '0') or '0'))
+                                _r_exec = Decimal(str(result.get('executedQty', '0') or '0'))
+                                _r_cq = Decimal(str(result.get('cumQuote', '0') or '0'))
+                                if _r_avg <= 0 and _r_exec > 0:
+                                    if _r_cq > 0:
+                                        result['avgPrice'] = str(_r_cq / _r_exec)
+                                        result['avgPriceSource'] = 'cum_quote'
+                                    elif result.get('orderId'):
+                                        _bf_params = _bn_auth.sign(
+                                            {"symbol": _symbol, "orderId": str(result['orderId'])})
+                                        _bf_q = await self._binance_rest_fallback(
+                                            _bn_auth, _session, "GET", "/fapi/v1/order",
+                                            _bf_params, signed=False)
+                                        if isinstance(_bf_q, dict) and _bf_q.get('code') is None:
+                                            _bf_avg = Decimal(str(_bf_q.get('avgPrice', '0') or '0'))
+                                            _bf_cq = Decimal(str(_bf_q.get('cumQuote', '0') or '0'))
+                                            _bf_z = Decimal(str(_bf_q.get('executedQty', '0') or '0'))
+                                            if _bf_avg > 0:
+                                                result['avgPrice'] = str(_bf_avg)
+                                                result['avgPriceSource'] = 'rest_requery'
+                                            elif _bf_cq > 0 and _bf_z > 0:
+                                                result['avgPrice'] = str(_bf_cq / _bf_z)
+                                                result['avgPriceSource'] = 'rest_cum_quote'
+                            except Exception as _bf_err:
+                                logger.warning(f"[Binance平仓TWAP/REST] 均价回填异常 (忽略): {_bf_err}")
                             _filled = _record_twap_fill(result, _slice_qty, "REST")
                             _rest_cap = max(_rest_cap - _filled, Decimal('0'))
                             if _filled <= 0:
@@ -1094,12 +1290,20 @@ class SettlementMixin:
 
                     _status = result.get('status', 'unknown') if result else 'None'
                     if result and _status in ('FILLED', 'PARTIALLY_FILLED'):
+                        # 🌟 ARCH-02 修复: 结算TWAP主路径同样消费估算标记 (与 _record_twap_fill 对齐),
+                        # 否则 mark_fallback 估算价静默混入结算 VWAP 且交割记录无标注
+                        if result.get('avgPriceSource') == 'mark_fallback':
+                            state._bn_close_price_estimated = True
                         _filled = Decimal(str(result.get('executedQty', '0'))) if result else Decimal('0')
                         if _filled <= 0 and _status == 'FILLED':
                             _filled = _slice_qty
                         _raw_avg = _decimal_or_zero(result.get('avgPrice')) if isinstance(result, dict) else Decimal('0')
                         _avg = _extract_binance_fill_avg(result, _filled, _last_avg if _last_avg > 0 else _acc_last_avg)
 
+                        if _filled > 0:
+                            # 🌟 R4-2: 真实成交台账 (与 _apply_combo_fill 同口径)
+                            state.binance_closed_qty_total = Decimal(str(
+                                getattr(state, 'binance_closed_qty_total', 0) or 0)) + _filled
                         state.binance_filled_qty = max(state.binance_filled_qty - _filled, Decimal('0'))
                         if state.binance_filled_qty <= _dust:
                             state.binance_filled_qty = Decimal('0')
@@ -1137,9 +1341,14 @@ class SettlementMixin:
                             'slices': _acc_slices + _order_count,
                             'lastAvg': float(_last_avg),
                         }
-                        # 🌟 2026-04-24 新增: 记录最近一次 Binance 对冲分片成功关闭时间
+                        # 🌟 2026-04-24 新增: 记录 Binance 对冲关闭时间
                         # 用于 '实际对冲关闭时间' 字段，让年化收益率不受 delivery 写入时差影响
-                        state._hedge_close_completed_ts = time.time()
+                        # 🌟 G4-01 修复: 该时间戳是 CR-2 因果仲裁的"强证据"(语义=全部平完),
+                        # 不得在每个分片后置位 — 否则平 1 片(3%)即永久授权对剩余 97% 的清零/断尾。
+                        # 仅在本分片后剩余量归零(真正全部平完)时置位; 部分成交时间记入展示用字段。
+                        state._hedge_last_fill_ts = time.time()
+                        if state.binance_filled_qty <= _dust:
+                            state._hedge_close_completed_ts = time.time()
                         try:
                             await self._save_state_to_redis(state)
                         except Exception as _redis_err:
@@ -1509,6 +1718,10 @@ class SettlementMixin:
         if bn_open_qty <= 0 and bn_entry > 0 and state.future_size_usd > 0:
             bn_open_qty = (state.future_size_usd / bn_entry)
         bn_close_price = Decimal('0')
+        # 🌟 REG-1 修复: bn_result 仅在路径A/B内赋值; "qty已为0且无TWAP结果"或非跨所组合
+        # 不经过任何分支, 下方 PnL 块的估算标记判断无条件引用它 → 必须预初始化防 NameError
+        # (否则交割每轮重试每轮抛错, 记录永不落库)
+        bn_result = None
 
         if state.binance_future_symbol:
             _bn_dust = Decimal('0.0001')
@@ -1554,7 +1767,11 @@ class SettlementMixin:
                 self._binance_close_failed_combos.discard(state.expiry_strike)
                 self._capture_binance_close_ids(state, bn_result)
                 # 🌟 2026-04-24: 路径B 同步关闭时间即对冲关闭时间
-                state._hedge_close_completed_ts = time.time()
+                # 🌟 R4-6 修复: reconciled(对账清零) 不铸造 CR-2 强证据
+                if not bn_result.get('reconciled'):
+                    state._hedge_close_completed_ts = time.time()
+                else:
+                    state._hedge_close_reconciled_ts = time.time()
                 try:
                     _close_avg = Decimal(str(bn_result.get('avgPrice', '0') or '0'))
                     _close_filled = Decimal(str(bn_result.get('executedQty', '0') or '0'))
@@ -1590,6 +1807,7 @@ class SettlementMixin:
         funding_net_usd = 0.0
         _fee_source = "estimated"
         _funding_source = "none"
+        _bn_close_estimated = False  # 期货平仓价是否为估算 (try 内可能改写, 记录引用须有默认值)
 
         try:
             # Deribit 期权盈亏 (BTC)
@@ -1600,7 +1818,24 @@ class SettlementMixin:
             deribit_pnl_usd = float(o_pnl * settlement_price)
 
             # Binance 期货盈亏 (USDT)
+            # 🌟 2026-06-11 修复: 真实平仓但均价缺失时用结算价估算并打标,
+            # 不再静默丢弃整条期货腿 (事故: 期货腿盈亏被 >0 守卫整段跳过, 日损基准失真)。
+            # 注: bn_result reconciled=True (对账清零, 无真实成交) 时 bn_close_price 保持 0,
+            #     此处不估算 — 那种情形期货腿确实没有发生平仓。
             bn_pnl_usdt = Decimal('0')
+            # 🌟 API-2 修复: TWAP 分片若用过标记价兜底, 整体平仓价视为含估算成分
+            _bn_close_estimated = bool(
+                getattr(state, '_bn_close_price_estimated', False)
+                or (bn_result and bn_result.get('avgPriceSource') == 'mark_fallback'))
+            if (bn_qty > 0 and bn_entry > 0 and bn_close_price <= 0
+                    and bn_result and not bn_result.get('reconciled')
+                    and Decimal(str(bn_result.get('executedQty', '0') or '0')) > 0):
+                if settlement_price > 0:
+                    bn_close_price = settlement_price
+                    _bn_close_estimated = True
+                    logger.warning(
+                        f"{log_prefix} Binance 平仓均价缺失, 以结算价 {settlement_price} "
+                        f"估算期货腿盈亏 (已打标)")
             if bn_qty > 0 and bn_close_price > 0 and bn_entry > 0:
                 if state.strategy_type == 'buy_future_sell_synthetic':
                     bn_pnl_usdt = (bn_close_price - bn_entry) * bn_qty
@@ -1795,7 +2030,11 @@ class SettlementMixin:
             'Call_ID': getattr(state, 'call_order_id', '') or 'UNCONFIRMED',
             'Put_ID': getattr(state, 'put_order_id', '') or 'UNCONFIRMED',
             'Future_ID': self._format_future_id(state),
-            '交易类型': '交割结算', '平仓原因': '到期交割',
+            '交易类型': '交割结算',
+            '平仓原因': (
+                '到期交割'
+                + ('(期货价为估算)' if _bn_close_estimated else '')
+                + ('(入场价为估算)' if getattr(state, '_bn_entry_price_estimated', False) else '')),
             '实际对冲关闭时间': time.strftime(
                 '%Y-%m-%d %H:%M:%S',
                 time.localtime(float(getattr(state, '_hedge_close_completed_ts', 0.0)) or time.time())),

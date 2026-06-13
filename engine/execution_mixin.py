@@ -1066,7 +1066,42 @@ class ExecutionMixin:
                             if _bn_result and _bn_result.get('status') == 'FILLED':
                                 _bn_avg = Decimal(str(_bn_result.get('avgPrice', '0')))
                                 _bn_filled = Decimal(str(_bn_result.get('executedQty', '0')))
+                                # 🌟 API-R2-04: 零均价成交回报 (-5022对账伪成功/回填全失败) →
+                                # 参考价估算+打标, 防止 binance_entry_price=0 静默落入状态机
+                                if _bn_avg <= 0 and _bn_filled > 0:
+                                    try:
+                                        _est_entry = await self._get_reference_btc_price(bn_symbol)
+                                    except Exception:
+                                        _est_entry = Decimal('0')
+                                    if _est_entry > 0:
+                                        _bn_avg = _est_entry
+                                        state._bn_entry_price_estimated = True
+                                        logger.warning(
+                                            f"{log_prefix}⚠️ Binance 成交回报均价为0, "
+                                            f"以参考价 {_est_entry} 估算入场价 (已打标)")
+                                        asyncio.create_task(tg_notifier.send_async(
+                                            f"⚠️ {log_prefix} Binance 对冲入场价为估算价 {_est_entry} "
+                                            f"(成交回报未含均价)"))
+                                    else:
+                                        # 🌟 L4-03: 参考价链也失效 — 零入场价不得静默落入状态机
+                                        state._bn_entry_price_estimated = True
+                                        logger.warning(
+                                            f"{log_prefix}🚨 Binance 成交回报均价为0 且参考价不可得, "
+                                            f"入场价将以 0 落入状态机 (已打标, PnL 将依赖后续对账/兜底)")
+                                        asyncio.create_task(tg_notifier.send_error_async(
+                                            f"🚨 {log_prefix} Binance 对冲入场价缺失且无参考价, "
+                                            f"请关注该组合 PnL 口径", "bn_entry_price_missing"))
                                 logger.info(f"{log_prefix}✅ Binance 对冲全额成交: {_bn_side} {_bn_filled} {bn_symbol} @ {_bn_avg}")
+                                # 🌟 API-2 修复: 入场价为标记价估算时打标+告警, 防止估算价
+                                # 被全生命周期 PnL 当成真实成交价而无感知
+                                if _bn_result.get('avgPriceSource') == 'mark_fallback':
+                                    state._bn_entry_price_estimated = True
+                                    logger.warning(
+                                        f"{log_prefix}⚠️ Binance 入场均价为标记价估算 "
+                                        f"(avgPriceSource=mark_fallback), 后续 PnL 含估算成分")
+                                    asyncio.create_task(tg_notifier.send_async(
+                                        f"⚠️ {log_prefix} Binance 对冲入场价为估算价 {_bn_avg} "
+                                        f"(交易所未返回成交均价)"))
                                 self._capture_binance_open_ids(state, _bn_result)
                                 state.binance_entry_price = _bn_avg
                                 state.binance_filled_qty = _bn_filled
@@ -1091,8 +1126,18 @@ class ExecutionMixin:
                                     if _retry and _retry.get('status') == 'FILLED':
                                         _bn_filled_2 = Decimal(str(_retry.get('executedQty', '0')))
                                         _bn_avg_2 = Decimal(str(_retry.get('avgPrice', '0')))
+                                        if _retry.get('avgPriceSource') == 'mark_fallback' or _bn_avg_2 <= 0:
+                                            state._bn_entry_price_estimated = True
+                                        # 🌟 A4-2: 零价腿(对账伪成功/回填失败)不计入加权分母, 防均价被稀释
                                         _bn_total = _bn_filled_1 + _bn_filled_2
-                                        _bn_wavg = (_bn_avg_1 * _bn_filled_1 + _bn_avg_2 * _bn_filled_2) / _bn_total if _bn_total > 0 else _bn_avg_1
+                                        if _bn_avg_1 > 0 and _bn_avg_2 > 0:
+                                            _bn_wavg = (_bn_avg_1 * _bn_filled_1 + _bn_avg_2 * _bn_filled_2) / _bn_total
+                                        elif _bn_avg_1 > 0:
+                                            _bn_wavg = _bn_avg_1
+                                        elif _bn_avg_2 > 0:
+                                            _bn_wavg = _bn_avg_2
+                                        else:
+                                            _bn_wavg = Decimal('0')
                                         self._capture_binance_open_ids(state, _bn_result, _retry)
                                         state.binance_entry_price = _bn_wavg
                                         state.binance_filled_qty = _bn_total
@@ -1441,7 +1486,9 @@ class ExecutionMixin:
                                 _f_pos = self.client.positions.get(combination['future'])
                                 _c_pos = self.client.positions.get(combination['call'])
                                 _p_pos = self.client.positions.get(combination['put'])
-                                await self._emergency_dump_all(state, combination, _f_pos, _c_pos, _p_pos)
+                                await self._emergency_dump_all(
+                                    state, combination, _f_pos, _c_pos, _p_pos,
+                                    reason='开仓负净利回滚')
                                 return
                             asyncio.create_task(tg_notifier.send_async(
                                 f"✅ 【套利开仓成功】\n"
@@ -1623,16 +1670,77 @@ class ExecutionMixin:
             # 🌟 连续失败递增冷却：开仓成功时清零，失败时递增冷却
             _state = self.arbitrage_states.get(expiry_strike)
             if _state and _state.state in ('position_open', 'executing'):
-                # 开仓成功 → 清除冷却
+                # 开仓成功 → 清除冷却 (reject_streak 的 key 是 (expiry_strike, err) 二元组,
+                # 须按首元素匹配清除)
                 self._combo_fail_count.pop(expiry_strike, None)
                 self._combo_cooldown_until.pop(expiry_strike, None)
+                for _rs_key in [k for k in self._combo_reject_streak if k[0] == expiry_strike]:
+                    self._combo_reject_streak.pop(_rs_key, None)
             else:
+                _now_cd = time.time()
+                # 🌟 2026-06-11 修复①: 失败计数 30 分钟无活动衰减
+                # (原计数器寿命=进程, 良性利润撤单跨数小时累积出"连败101次"的失真数字)
+                _last_fail_ts = self._combo_last_fail_ts.get(expiry_strike, 0.0)
+                if _last_fail_ts > 0 and (_now_cd - _last_fail_ts) > 1800:
+                    self._combo_fail_count.pop(expiry_strike, None)
+                    for _rs_key in [k for k in self._combo_reject_streak if k[0] == expiry_strike]:
+                        self._combo_reject_streak.pop(_rs_key, None)
+                self._combo_last_fail_ts[expiry_strike] = _now_cd
+
                 # 未开仓（机会消失/VWAP失败/超时撤单）→ 递增冷却
                 _fails = self._combo_fail_count.get(expiry_strike, 0) + 1
                 self._combo_fail_count[expiry_strike] = _fails
-                # 冷却时间: 5s → 15s → 45s (上限)
+                # 冷却时间: 5s → 15s → 45s (上限, 良性失败的正常做市节奏)
                 _cooldown_secs = min(45, 5 * (3 ** (_fails - 1)) if _fails <= 3 else 45)
-                self._combo_cooldown_until[expiry_strike] = time.time() + _cooldown_secs
+
+                # 🌟 2026-06-11 修复②: 交易所拒单升级冷却
+                # 事故: invalid_args_for_instrument 维护期拒单与良性利润撤单混在同一计数器,
+                # 45s 封顶导致 12 分钟 32 次拒单重试风暴 (全套 VWAP/保证金预检/API刷新)。
+                # 从 deribit_client.recent_order_errors 识别本组合近 15s 内的交易所拒单。
+                _reject_err = ''
+                try:
+                    _combo_def = self.arbitrage_combinations.get(expiry_strike) or {}
+                    _recent_errs = getattr(self.client, 'recent_order_errors', {}) or {}
+                    for _leg_key in ('call', 'put', 'future'):
+                        _leg_inst = _combo_def.get(_leg_key, '')
+                        _err_rec = _recent_errs.get(_leg_inst)
+                        if _err_rec and (_now_cd - _err_rec[0]) <= 15.0:
+                            _reject_err = _err_rec[1]
+                            break
+                except Exception:
+                    _reject_err = ''
+                if _reject_err:
+                    _streak_key = (expiry_strike, _reject_err)
+                    _streak = self._combo_reject_streak.get(_streak_key, 0) + 1
+                    self._combo_reject_streak[_streak_key] = _streak
+                    if _streak >= 10:
+                        # 持续拒单 → 当日级拉黑 (到下次合约刷新/重启), 释放扫描与 API 配额
+                        _cooldown_secs = 6 * 3600
+                        if self._should_emit_throttled(f"reject_blacklist:{expiry_strike}", 600):
+                            logger.error(
+                                f"🚫 [{expiry}-{strike}] 交易所拒单 '{_reject_err}' 连续 {_streak} 次, "
+                                f"拉黑该组合 6 小时")
+                            asyncio.create_task(tg_notifier.send_error_async(
+                                f"🚫 [{expiry}-{strike}] 交易所持续拒单\n"
+                                f"错误: {_reject_err}\n连续 {_streak} 次, 已拉黑 6 小时",
+                                "combo_reject_blacklist"))
+                    elif _streak >= 5:
+                        _cooldown_secs = 1800
+                        if self._should_emit_throttled(f"reject_escalate:{expiry_strike}", 600):
+                            logger.warning(
+                                f"⚠️ [{expiry}-{strike}] 交易所拒单 '{_reject_err}' 连续 {_streak} 次, "
+                                f"冷却升级至 30 分钟")
+                            asyncio.create_task(tg_notifier.send_error_async(
+                                f"⚠️ [{expiry}-{strike}] 交易所拒单 '{_reject_err}' 连续 {_streak} 次, "
+                                f"冷却 30 分钟 (10 次将拉黑)",
+                                "combo_reject_escalate"))
+                    elif _streak >= 3:
+                        _cooldown_secs = 300
+                        logger.warning(
+                            f"⚠️ [{expiry}-{strike}] 交易所拒单 '{_reject_err}' 连续 {_streak} 次, "
+                            f"冷却升级至 5 分钟")
+
+                self._combo_cooldown_until[expiry_strike] = _now_cd + _cooldown_secs
                 if _fails >= 3:
                     logger.info(f"[{expiry}-{strike}] 连续失败 {_fails} 次，冷却 {_cooldown_secs}s")
 
@@ -1713,6 +1821,14 @@ class ExecutionMixin:
             finally:
                 if _session:
                     await _session.close()
+
+        # 🌟 ARCH-04 修复①: 直连 REST 成功同样恢复持仓快照可信标记 (一次性) —
+        # 否则 ws 客户端 REST 持续失败而直连正常时, trusted 永远 False → 裸腿 L1 永久冻结
+        if _rest_confirmed and self.binance_ws is not None and not getattr(
+                self.binance_ws, 'position_snapshot_ok', True):
+            self.binance_ws.position_snapshot_ok = True
+            self.binance_ws.position_snapshot_at = time.time()
+            logger.info("[Binance持仓对账] 直连 REST 查询成功, 持仓快照可信标记已恢复 (预热重新计时)")
 
         if not _risk_rows:
             # 只有拿到有效响应并确认无仓位时，才能返回 known=True

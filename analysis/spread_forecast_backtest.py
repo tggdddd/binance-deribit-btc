@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from statistics import mean, median
 
 METRICS = {"maker_net_sell", "maker_net_buy", "net_sell", "net_buy", "spread_sell", "spread_buy"}
-METHODS = ("naive", "mean", "drift", "seasonal_naive")
+BASE_METHODS = ("naive", "mean", "drift", "seasonal_naive")
+SIMPLE_UNION_METHOD = "simple_union"
+METHODS = (*BASE_METHODS, SIMPLE_UNION_METHOD)
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,10 @@ def _forecast(method: str, hist: list[float], season: int, horizon: int) -> floa
             idx = len(hist) - season + ((horizon - 1) % season)
             return hist[idx] if 0 <= idx < len(hist) else hist[-season]
         return hist[-1]
+    if method == SIMPLE_UNION_METHOD:
+        preds = [_forecast(m, hist, season, horizon) for m in BASE_METHODS]
+        preds = [p for p in preds if p is not None]
+        return median(preds) if preds else None
     raise ValueError(method)
 
 
@@ -124,22 +130,42 @@ def run(db_path: str, metric: str, horizon: int, min_train: int, season: int,
                 if pred is None:
                     continue
                 historical_residuals: list[float] = []
-                for back_origin in range(min_train, origin):
-                    back_hist = series[:back_origin]
-                    back_idx = back_origin + horizon - 1
-                    if back_idx >= origin:
-                        break
-                    back_pred = _forecast(method, back_hist, season, horizon)
-                    if back_pred is not None:
-                        historical_residuals.append(series[back_idx] - back_pred)
+                interval_candidates: list[tuple[float, float, float, float]] = []
+                interval_methods = BASE_METHODS if method == SIMPLE_UNION_METHOD else (method,)
+                for interval_method in interval_methods:
+                    method_residuals: list[float] = []
+                    for back_origin in range(min_train, origin):
+                        back_hist = series[:back_origin]
+                        back_idx = back_origin + horizon - 1
+                        if back_idx >= origin:
+                            break
+                        back_pred = _forecast(interval_method, back_hist, season, horizon)
+                        if back_pred is not None:
+                            method_residuals.append(series[back_idx] - back_pred)
+                    if method == SIMPLE_UNION_METHOD:
+                        if len(method_residuals) >= 20:
+                            interval_candidates.append((
+                                pred + _quantile(method_residuals, 0.10),
+                                pred + _quantile(method_residuals, 0.90),
+                                pred + _quantile(method_residuals, 0.025),
+                                pred + _quantile(method_residuals, 0.975),
+                            ))
+                    else:
+                        historical_residuals = method_residuals
 
                 lo80 = hi80 = lo95 = hi95 = ""
                 in80 = in95 = ""
-                if len(historical_residuals) >= 20:
+                if method == SIMPLE_UNION_METHOD and interval_candidates:
+                    lo80 = min(c[0] for c in interval_candidates)
+                    hi80 = max(c[1] for c in interval_candidates)
+                    lo95 = min(c[2] for c in interval_candidates)
+                    hi95 = max(c[3] for c in interval_candidates)
+                elif len(historical_residuals) >= 20:
                     lo80 = pred + _quantile(historical_residuals, 0.10)
                     hi80 = pred + _quantile(historical_residuals, 0.90)
                     lo95 = pred + _quantile(historical_residuals, 0.025)
                     hi95 = pred + _quantile(historical_residuals, 0.975)
+                if lo80 != "":
                     in80 = int(float(lo80) <= actual <= float(hi80))
                     in95 = int(float(lo95) <= actual <= float(hi95))
                     stats[method]["inside80"].append(in80)

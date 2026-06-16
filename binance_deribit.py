@@ -99,7 +99,7 @@ async def _preflight_check(allow_force: bool = False) -> bool:
     finally:
         if _r_pre is not None:
             try:
-                await _r_pre.close()
+                await _r_pre.aclose()
             except Exception:
                 pass
 
@@ -330,7 +330,7 @@ async def main():
 
         engine.scan_interval_ms = base_cfg["scan_interval_ms"]
         engine.futures_numbers = base_cfg["futures_numbers"]
-        engine.max_wait_time = base_cfg["max_wait_time"]
+        engine.max_wait_time = int(base_cfg.get("max_wait_time", 60))
         engine.concurrent_batch_size = base_cfg["concurrent_batch_size"]
         engine.batch_interval = base_cfg.get("batch_interval", 0.5)
         engine._settlement_pause_seconds = float(base_cfg.get("settlement_pause_seconds", 120))

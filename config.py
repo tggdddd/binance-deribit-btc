@@ -52,6 +52,11 @@ BASE_CONFIG = {
     "global_max_delta" : 0.15,      # 第一层警告阈值：Gamma漂移监控，超过只记日志不暂停
     "global_hard_delta" : 0.50,     # 第二层熔断阈值：裸腿风险，超过暂停+自动平仓裸腿
     "record_spread_snapshots": False,  # 是否记录 spread_snapshots 价差快照；关闭可降低 SQLite 增长速度
+    "spread_record_interval_sec": 300,  # 价差快照采样间隔；开启研究/回测时建议 60~300s
+    "spread_snapshot_retention_days": 30,  # 价差快照保留天数，0=不自动清理
+    "research_mode": False,  # True 时可用于离线预测/回测采样，不直接改变下单逻辑
+    "use_dynamic_profit_threshold": False,  # 基于历史预测误差的动态利润阈值；默认关闭
+    "opportunity_sort_mode": "net_profit",  # net_profit 或 risk_adjusted
 }
 
 ########################BTC配置######################

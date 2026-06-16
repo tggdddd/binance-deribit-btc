@@ -146,6 +146,9 @@ BINANCE_API_SECRET=
 BASE_CONFIG = {
     "target_currency": "BTC",
     "test_trading": True,
+    "record_spread_snapshots": False,
+    "spread_record_interval_sec": 300,
+    "research_mode": False,
 }
 
 BINANCE_CONFIG = {
@@ -161,12 +164,27 @@ BINANCE_CONFIG = {
 - `BASE_CONFIG["test_trading"] = True`
 - `BINANCE_CONFIG["use_testnet"] = True`
 - 使用 Deribit 测试网和 Binance Futures 测试网 API Key
+- 如需做《预测：方法与实践》式的滚动回测、残差诊断和阈值校准，可将
+  `BASE_CONFIG["record_spread_snapshots"] = True`，并按需要缩短
+  `spread_record_interval_sec`。该配置只记录研究数据，不会单独改变下单逻辑。
 
 实盘运行前：
 
 - 将 `BASE_CONFIG["test_trading"]` 改为 `False`
 - 将 `BINANCE_CONFIG["use_testnet"]` 改为 `False`
 - 重新确认 API Key 权限、杠杆、保证金模式、交易量、止损、利润门槛和风控参数
+
+## 离线预测与回测分析
+
+开启 `record_spread_snapshots` 并积累样本后，可以运行基准预测回测：
+
+```bash
+python analysis/spread_forecast_backtest.py trading_BTC_testnet.db --metric maker_net_sell --horizon 1 --out forecast_backtest_results.csv
+python analysis/residual_diagnostics.py forecast_backtest_results.csv
+```
+
+这些脚本只读取 SQLite 快照并输出统计结果，用于比较 naive、mean、drift、
+seasonal naive 等基准模型，辅助校准利润阈值、funding 扣减和 Maker 激进度。
 
 ## 启动主程序
 

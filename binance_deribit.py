@@ -341,6 +341,11 @@ async def main():
         engine.maker_top5_log_interval_seconds = max(
             float(base_cfg.get("maker_top5_log_interval_seconds", 300)), 1.0)
         engine.record_spread_snapshots = bool(base_cfg.get("record_spread_snapshots", True))
+        engine._spread_record_interval = max(float(base_cfg.get("spread_record_interval_sec", 300)), 1.0)
+        engine.spread_snapshot_retention_days = max(int(base_cfg.get("spread_snapshot_retention_days", 30)), 0)
+        engine.research_mode = bool(base_cfg.get("research_mode", False))
+        engine.use_dynamic_profit_threshold = bool(base_cfg.get("use_dynamic_profit_threshold", False))
+        engine.opportunity_sort_mode = str(base_cfg.get("opportunity_sort_mode", "net_profit")).lower()
         # 全局风控参数
         engine.global_max_delta = Decimal(str(base_cfg.get("global_max_delta", 0.15)))
         engine.global_hard_delta = Decimal(str(base_cfg.get("global_hard_delta", 0.50)))

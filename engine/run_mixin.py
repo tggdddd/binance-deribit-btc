@@ -19,6 +19,35 @@ logger = logging.getLogger(__name__)
 class RunMixin:
     """Mixin: 引擎主循环 + 价差快照记录 + BTC 参考价获取"""
 
+    def _record_funding_snapshot(self) -> None:
+        """记录当前 Binance funding 快照，供离线预测与阈值校准使用。"""
+        try:
+            if not getattr(self, 'research_mode', False):
+                return
+            if not getattr(self, 'binance_ws', None):
+                return
+            symbol = ''
+            try:
+                symbol = self.binance_matcher.perpetual_symbol if hasattr(self, 'binance_matcher') else ''
+            except Exception:
+                symbol = ''
+            if not symbol:
+                return
+            rate = self.binance_ws.funding_rates.get(symbol, Decimal('0'))
+            mark = self.binance_ws.mark_prices.get(symbol, Decimal('0'))
+            store = getattr(self, '_funding_store', None)
+            if store is None:
+                return
+            store.insert_sync({
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'symbol': symbol,
+                'funding_rate': float(rate or 0),
+                'mark_price': float(mark or 0),
+                'source': 'engine_loop',
+            })
+        except Exception as exc:
+            logger.debug(f"funding 快照写入失败: {exc}")
+
     async def _get_reference_btc_price(self, preferred_symbol: str = "") -> Decimal:
         """获取 BTC/USD 风控参考价（Binance 优先，Deribit 次之）"""
         # 1) Binance 永续盘口 / 标记价 / 最新成交
@@ -585,6 +614,17 @@ class RunMixin:
                     if (self.binance_ws and self.binance_connected and
                             time.time() - self._spread_last_record > self._spread_record_interval):
                         self._record_spread_snapshot()
+                        self._record_funding_snapshot()
+                        _retention_days = int(getattr(self, 'spread_snapshot_retention_days', 0) or 0)
+                        if (_retention_days > 0 and
+                                time.time() - getattr(self, '_spread_retention_last_cleanup', 0.0) > 86400):
+                            try:
+                                _deleted = self._spread_store.delete_older_than_days_sync(_retention_days)
+                                self._spread_retention_last_cleanup = time.time()
+                                if _deleted:
+                                    logger.info(f"🧹 清理过期价差快照: {_deleted} 条 (保留 {_retention_days} 天)")
+                            except Exception as _cleanup_err:
+                                logger.debug(f"价差快照保留期清理失败: {_cleanup_err}")
 
                     # ================= 每日结算窗口自动规避 =================
                     # 必须在 trading_paused 检查之前调用，否则结算窗口结束后无法自动恢复
@@ -667,8 +707,13 @@ class RunMixin:
                     opportunities = await self.scan_arbitrage_opportunities()
 
                     if opportunities:
-                        # 按利润从高到低排序
-                        opportunities.sort(key=lambda x: x['net_profit'], reverse=True)
+                        # 按利润或风险调整分数从高到低排序
+                        if getattr(self, 'opportunity_sort_mode', 'net_profit') == 'risk_adjusted':
+                            opportunities.sort(
+                                key=lambda x: x.get('risk_adjusted_score', x.get('net_profit', 0)),
+                                reverse=True)
+                        else:
+                            opportunities.sort(key=lambda x: x['net_profit'], reverse=True)
 
                         # 🌟 每到期日持仓上限: 分散风险，避免同一到期日过度集中
                         _max_per_expiry = getattr(self, 'max_positions_per_expiry', 3)

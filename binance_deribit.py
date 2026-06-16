@@ -7,7 +7,7 @@ import shutil
 from decimal import Decimal
 from typing import List
 
-import redis.asyncio as redisf
+import redis.asyncio as redis
 import aiohttp
 
 import config
@@ -156,7 +156,11 @@ async def _preflight_check(allow_force: bool = False) -> bool:
 
     # ===== Check 7: Binance REST + 认证 + 持仓 =====
     if bn_configured:
-        bn_url = "https://testnet.binancefuture.com" if bn_cfg.get("use_testnet", True) else "https://fapi.binance.com"
+        _bn_auth_pre = binance_futures.BinanceAuth(
+            api_key=bn_cfg["API_KEY"],
+            api_secret=bn_cfg["API_SECRET"],
+            is_testnet=bn_cfg.get("use_testnet", True))
+        bn_url = _bn_auth_pre.rest_base
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as _s:
                 async with _s.get(f"{bn_url}/fapi/v1/ping") as _resp:
@@ -164,10 +168,6 @@ async def _preflight_check(allow_force: bool = False) -> bool:
                         issues_critical.append(f"Binance REST 不可达 ({bn_url}, HTTP {_resp.status})")
                         raise RuntimeError("ping failed")
 
-                _bn_auth_pre = binance_futures.BinanceAuth(
-                    api_key=bn_cfg["API_KEY"],
-                    api_secret=bn_cfg["API_SECRET"],
-                    is_testnet=bn_cfg.get("use_testnet", True))
                 _params = _bn_auth_pre.sign({"recvWindow": "5000"})
                 _query = "&".join(f"{k}={v}" for k, v in _params.items())
                 async with _s.get(

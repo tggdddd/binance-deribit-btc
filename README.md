@@ -146,6 +146,15 @@ BINANCE_API_SECRET=
 BASE_CONFIG = {
     "target_currency": "BTC",
     "test_trading": True,
+    "scan_interval_ms": 500,
+    "futures_numbers": 4,
+    "concurrent_batch_size": 4,
+    "batch_interval": 0.5,
+    "max_wait_time": 60,
+    "max_total_positions": 10,
+    "daily_loss_limit_usd": 0,
+    "daily_loss_auto_close": False,
+    "risk_alert_throttle_seconds": 300,
     "record_spread_snapshots": False,
     "spread_record_interval_sec": 300,
     "research_mode": False,
@@ -158,6 +167,14 @@ BINANCE_CONFIG = {
     "margin_type": "ISOLATED",
 }
 ```
+
+新增的运行参数说明：
+
+- `max_wait_time`：Deribit Maker 锚定腿最长等待秒数，主程序启动时会直接读取。
+- `batch_interval`：批量开仓任务之间的间隔，避免瞬时请求过载。
+- `max_total_positions`：全局最大活跃套利组合数量。
+- `daily_loss_limit_usd` / `daily_loss_auto_close`：日损熔断阈值与触发后是否自动清仓。
+- `risk_alert_throttle_seconds`：风控日志与告警节流间隔。
 
 测试网运行时：
 

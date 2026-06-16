@@ -31,7 +31,7 @@ CURRENCY = config.BASE_CONFIG.get("target_currency", "BTC")
 IS_TESTNET = config.BASE_CONFIG.get("test_trading", True)
 API_BASE = "https://test.deribit.com" if IS_TESTNET else "https://www.deribit.com"
 
-COIN_CONFIG = config.BTC_CONFIG if CURRENCY == "BTC" else config.ETH_CONFIG
+COIN_CONFIG = config.get_currency_config(CURRENCY)
 CLIENT_ID = COIN_CONFIG["CLIENT_ID"]
 CLIENT_SECRET = COIN_CONFIG["CLIENT_SECRET"]
 
@@ -2024,7 +2024,7 @@ if __name__ == "__main__":
 
     if args.currency:
         CURRENCY = args.currency.upper()
-        COIN_CONFIG = config.BTC_CONFIG if CURRENCY == "BTC" else config.ETH_CONFIG
+        COIN_CONFIG = config.get_currency_config(CURRENCY)
         CLIENT_ID = COIN_CONFIG["CLIENT_ID"]
         CLIENT_SECRET = COIN_CONFIG["CLIENT_SECRET"]
         LOG_FILE = BASE_DIR / f"{CURRENCY}-log.txt"

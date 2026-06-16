@@ -48,9 +48,19 @@ BASE_CONFIG = {
     "futures_numbers" : 4,          # 只扫描最近几个到期日，DTE>72h 的期权会被过滤
     "current_tier" : "standard",    ###后续要验证获取的费用信息跟vip是否一致。Deribit 费率等级 'standard' 或 'vip1'
     "concurrent_batch_size" : 4,    # 每批并发执行数 (建议 3-5)
+    "batch_interval": 0.5,          # 批次间隔 (秒)，防止瞬时请求过载
+    "max_wait_time": 60,            # Deribit Maker 锚定腿最大等待时间 (秒)
+    "max_total_positions": 10,      # 全局最大活跃组合数量
     # ============ 全局风控参数 ============
     "global_max_delta" : 0.15,      # 第一层警告阈值：Gamma漂移监控，超过只记日志不暂停
     "global_hard_delta" : 0.50,     # 第二层熔断阈值：裸腿风险，超过暂停+自动平仓裸腿
+    "daily_loss_limit_usd": 0,      # 日损熔断阈值；0=关闭
+    "daily_loss_auto_close": False, # 触发日损熔断后是否自动清仓
+    "settlement_pause_seconds": 120,  # 结算核心窗口前后暂停开仓秒数
+    "settlement_hard_stop_guard": True,  # 结算窗口内延迟硬止损，避免结算价噪声误触发
+    "settlement_hard_stop_grace_seconds": 1200,  # 结算硬止损保护缓冲秒数
+    "risk_alert_throttle_seconds": 300,  # 风控告警/日志最小间隔
+    "maker_top5_log_interval_seconds": 300,  # Maker 测算利润 Top5 聚合日志间隔
     "record_spread_snapshots": False,  # 是否记录 spread_snapshots 价差快照；关闭可降低 SQLite 增长速度
     "spread_record_interval_sec": 300,  # 价差快照采样间隔；开启研究/回测时建议 60~300s
     "spread_snapshot_retention_days": 30,  # 价差快照保留天数，0=不自动清理
@@ -82,6 +92,26 @@ BTC_CONFIG = {
     "basis_early_trigger_usd": 300.0,     # 绝对基差超此值触发提前 TWAP
     "basis_deterioration_trigger_usd": 150.0,  # 基差从开仓起恶化超此值也触发提前 TWAP
 }
+
+########################ETH配置######################
+# 预留 ETH 支持；默认参数与 BTC 一致，但读取独立 Deribit ETH API 凭证。
+# 注意：切换到 ETH 前仍需在测试网充分验证交易所合约、面值和风控参数。
+ETH_CONFIG = {
+    **BTC_CONFIG,
+    "CLIENT_ID": _env("DERIBIT_ETH_CLIENT_ID"),
+    "CLIENT_SECRET": _env("DERIBIT_ETH_CLIENT_SECRET"),
+}
+
+
+def get_currency_config(currency: str) -> dict:
+    """按币种返回策略配置；不支持的币种尽早失败，避免启动中途 AttributeError。"""
+    normalized = str(currency or "").upper()
+    if normalized == "BTC":
+        return BTC_CONFIG
+    if normalized == "ETH":
+        return ETH_CONFIG
+    raise ValueError(f"不支持的 target_currency: {currency!r}; 目前仅支持 BTC / ETH")
+
 
 ########################Binance 期货配置######################
 # API Key 读取自 .env 文件 (BINANCE_API_KEY / BINANCE_API_SECRET)

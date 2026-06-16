@@ -46,7 +46,7 @@ async def _preflight_check(allow_force: bool = False) -> bool:
     base_cfg = config.BASE_CONFIG
     target_currency = base_cfg.get("target_currency", "BTC")
     is_testnet = bool(base_cfg.get("test_trading", True))
-    currency_cfg = config.BTC_CONFIG if target_currency == "BTC" else config.ETH_CONFIG
+    currency_cfg = config.get_currency_config(target_currency)
     bn_cfg = config.BINANCE_CONFIG
     tg_cfg = getattr(config, 'TELEGRAM_CONFIG', {}) or {}
 
@@ -285,7 +285,7 @@ async def main():
         # ====== 1. 解析字典配置 ======
         base_cfg = config.BASE_CONFIG
         target_currency = base_cfg["target_currency"]
-        currency_cfg = config.BTC_CONFIG if target_currency == "BTC" else config.ETH_CONFIG
+        currency_cfg = config.get_currency_config(target_currency)
         client_id = currency_cfg["CLIENT_ID"]
         client_secret = currency_cfg["CLIENT_SECRET"]
         is_testnet = base_cfg["test_trading"]

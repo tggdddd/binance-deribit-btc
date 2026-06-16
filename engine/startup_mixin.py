@@ -868,8 +868,10 @@ class StartupMixin:
         try:
             await self._trade_store.init()
             await self._spread_store.init()
+            if hasattr(self, '_funding_store'):
+                await self._funding_store.init()
         except Exception as _e:
-            logger.error(f"❌ TradeStore/SpreadStore schema 初始化失败: {_e}")
+            logger.error(f"❌ TradeStore/SpreadStore/FundingSnapshotStore schema 初始化失败: {_e}")
             return
 
         # --- 步骤 2: WAL 残留回放 ---

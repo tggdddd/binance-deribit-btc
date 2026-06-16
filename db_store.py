@@ -264,7 +264,6 @@ class DrawdownStore:
     async def import_from_csv(self, csv_path: str) -> int:
         return await asyncio.to_thread(self.import_from_csv_sync, csv_path)
 
-
 # ================= AccountEquityStore =================
 
 class AccountEquityStore:
@@ -836,3 +835,86 @@ class SpreadStore:
 
     async def import_from_csv(self, csv_path: str) -> int:
         return await asyncio.to_thread(self.import_from_csv_sync, csv_path)
+
+    def delete_older_than_days_sync(self, retention_days: int) -> int:
+        if retention_days <= 0:
+            return 0
+        conn = _open_conn(self._path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM spread_snapshots WHERE timestamp < datetime('now', ?)",
+                (f"-{int(retention_days)} days",),
+            )
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
+
+    async def delete_older_than_days(self, retention_days: int) -> int:
+        return await asyncio.to_thread(self.delete_older_than_days_sync, retention_days)
+
+
+# ================= FundingSnapshotStore =================
+
+class FundingSnapshotStore:
+    """Binance funding 历史快照，用于离线预测/回测与保守 funding 成本估计。"""
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS funding_snapshots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp    TEXT NOT NULL,
+            symbol       TEXT NOT NULL,
+            funding_rate REAL,
+            mark_price   REAL,
+            source       TEXT
+        )
+    """
+    INDEXES = [
+        "CREATE INDEX IF NOT EXISTS idx_funding_symbol_ts ON funding_snapshots(symbol, timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_funding_ts ON funding_snapshots(timestamp)",
+    ]
+
+    def __init__(self, db_path: str):
+        self._path = db_path
+        self._init_done = False
+
+    def _ensure_schema_sync(self) -> None:
+        _init_db_pragmas(self._path)
+        conn = _open_conn(self._path)
+        try:
+            conn.execute(self.SCHEMA)
+            for idx in self.INDEXES:
+                conn.execute(idx)
+        finally:
+            conn.close()
+
+    async def init(self) -> None:
+        if self._init_done:
+            return
+        await asyncio.to_thread(self._ensure_schema_sync)
+        self._init_done = True
+
+    def insert_sync(self, row: Dict) -> int:
+        if not row:
+            return 0
+        conn = _open_conn(self._path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO funding_snapshots
+                    (timestamp, symbol, funding_rate, mark_price, source)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row.get("timestamp") or time.strftime('%Y-%m-%d %H:%M:%S')),
+                    str(row.get("symbol") or ""),
+                    float(row.get("funding_rate") or 0.0),
+                    float(row.get("mark_price") or 0.0),
+                    str(row.get("source") or "engine"),
+                ),
+            )
+            return 1
+        finally:
+            conn.close()
+
+    async def insert(self, row: Dict) -> int:
+        return await asyncio.to_thread(self.insert_sync, row)

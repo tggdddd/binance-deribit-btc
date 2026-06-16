@@ -21,6 +21,33 @@ logger = logging.getLogger(__name__)
 class ExecutionMixin:
     """Mixin: 交易验证+执行 + VWAP/自适应定价 + Binance 仓位查询"""
 
+    def _compute_dynamic_profit_threshold(self, base_threshold: Decimal, context: Optional[Dict[str, Any]] = None) -> Decimal:
+        """基于历史预测误差的动态利润阈值。
+
+        默认只在 `use_dynamic_profit_threshold=True` 时启用；当前版本先提供
+        可审计的轻量骨架，在没有离线误差统计输入时安全回退到静态阈值。
+        """
+        if not getattr(self, 'use_dynamic_profit_threshold', False):
+            return base_threshold
+        try:
+            ctx = context or {}
+            liquidity_penalty = Decimal('0')
+            for key in ('c_spread_usd', 'p_spread_usd'):
+                val = Decimal(str(ctx.get(key, 0) or 0))
+                if val > Decimal('50'):
+                    liquidity_penalty += min((val - Decimal('50')) * Decimal('0.02'), Decimal('10'))
+            funding_uncertainty = abs(Decimal(str(ctx.get('funding_usd', 0) or 0))) * Decimal('0.25')
+            dynamic_threshold = base_threshold + liquidity_penalty + funding_uncertainty
+            if dynamic_threshold != base_threshold:
+                logger.info(
+                    f"📈 动态利润阈值: base={base_threshold:.2f}, "
+                    f"liquidity_buffer={liquidity_penalty:.2f}, "
+                    f"funding_buffer={funding_uncertainty:.2f}, final={dynamic_threshold:.2f}")
+            return dynamic_threshold
+        except Exception as exc:
+            logger.debug(f"动态利润阈值计算失败，回退静态阈值: {exc}")
+            return base_threshold
+
     @staticmethod
     def _entry_pnl_metrics(sim_res: dict, actual_res: dict,
                            settle_fee: float, funding_fee: float) -> dict:
@@ -540,6 +567,14 @@ class ExecutionMixin:
             bn_ask = bn_ob.best_ask
             if not bn_bid or not bn_ask or bn_bid <= 0 or bn_ask <= 0:
                 return
+            _verify_threshold = self._compute_dynamic_profit_threshold(
+                self.min_profit_threshold,
+                {
+                    'c_spread_usd': (call_ticker.ask - call_ticker.bid) * bn_ob.mid_price
+                    if call_ticker.ask > 0 and call_ticker.bid > 0 else 0,
+                    'p_spread_usd': (put_ticker.ask - put_ticker.bid) * bn_ob.mid_price
+                    if put_ticker.ask > 0 and put_ticker.bid > 0 else 0,
+                })
 
             # ===== funding 费用预估（按方向保留符号） =====
             _verify_funding_long_usd = Decimal('0')

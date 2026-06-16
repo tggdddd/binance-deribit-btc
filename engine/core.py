@@ -96,6 +96,7 @@ class RealTimeArbitrageEngineCore:
         self._account_equity_date = None
         self._trade_store = db_store.TradeStore(self._db_path)
         self._spread_store = db_store.SpreadStore(self._db_path)
+        self._funding_store = db_store.FundingSnapshotStore(self._db_path)
         # ================= Redis与异步队列 =================
         _currency = config.BASE_CONFIG.get("target_currency", "BTC")
         _db_map = {
@@ -200,7 +201,12 @@ class RealTimeArbitrageEngineCore:
         self.post_fill_negative_action = "hold"
         self._spread_record_interval = 300
         self._spread_last_record = 0.0
+        self._spread_retention_last_cleanup = 0.0
         self.record_spread_snapshots = True
+        self.spread_snapshot_retention_days = 30
+        self.research_mode = False
+        self.use_dynamic_profit_threshold = False
+        self.opportunity_sort_mode = "net_profit"
         self.maker_top5_log_interval_seconds = 300.0
         self._scan_maker_top_profit_samples = []
         self._scan_maker_top_profit_window_started = 0.0

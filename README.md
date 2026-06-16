@@ -179,12 +179,19 @@ BINANCE_CONFIG = {
 开启 `record_spread_snapshots` 并积累样本后，可以运行基准预测回测：
 
 ```bash
-python analysis/spread_forecast_backtest.py trading_BTC_testnet.db --metric maker_net_sell --horizon 1 --out forecast_backtest_results.csv
-python analysis/residual_diagnostics.py forecast_backtest_results.csv
+python analysis/spread_forecast_backtest.py trading_BTC_testnet.db --metric maker_net_sell --horizon 1 --season 12 --out forecast_backtest_results.csv --residuals-out forecast_residuals.csv
+python analysis/residual_diagnostics.py forecast_residuals.csv
 ```
 
-这些脚本只读取 SQLite 快照并输出统计结果，用于比较 naive、mean、drift、
-seasonal naive 等基准模型，辅助校准利润阈值、funding 扣减和 Maker 激进度。
+这组脚本按《预测：方法与实践》的思路做离线校准：
+
+- 使用滚动起点（rolling-origin）时间序列交叉验证，避免随机切分造成未来数据泄漏。
+- 先比较 naive、mean、drift、seasonal naive 等可解释基准模型，再考虑更复杂信号。
+- 输出 MAE、RMSE、MASE、方向命中率、残差偏差、分位数预测区间覆盖率等指标。
+- `forecast_residuals.csv` 保存逐起点残差；`residual_diagnostics.py` 会检查残差偏差、ACF(1)、Ljung-Box Q 统计量和预测区间欠覆盖。
+
+建议把通过回测得到的误差分位数作为利润门槛、funding buffer 和 Maker 激进度的
+“安全垫”参考，而不是直接用单次样本最优结果调参。
 
 ## 启动主程序
 

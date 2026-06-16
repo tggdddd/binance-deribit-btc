@@ -25,6 +25,7 @@ import argparse
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 import config
+from binance_futures import BinanceAuth
 
 CURRENCY = config.BASE_CONFIG.get("target_currency", "BTC")
 IS_TESTNET = config.BASE_CONFIG.get("test_trading", True)
@@ -42,7 +43,7 @@ _TRADE_DB_PATH = BASE_DIR / f"trading_{CURRENCY}_{_ENV_SUFFIX}.db"
 BN_API_KEY = config.BINANCE_CONFIG.get("API_KEY", "")
 BN_API_SECRET = config.BINANCE_CONFIG.get("API_SECRET", "")
 BN_USE_TESTNET = config.BINANCE_CONFIG.get("use_testnet", True)
-BN_API_BASE = "https://demo-fapi.binance.com" if BN_USE_TESTNET else "https://fapi.binance.com"
+BN_API_BASE = BinanceAuth.REST_BASE_TESTNET if BN_USE_TESTNET else BinanceAuth.REST_BASE
 
 
 def _binance_signed_request(endpoint, params=None):
@@ -69,14 +70,15 @@ from functools import wraps as _wraps
 
 app = Flask(__name__)
 
-# ======================== 认证系统 (admin-only, 默认密码 123456) ========================
+# ======================== 认证系统 (admin-only, 首次运行生成强随机密码) ========================
 # 凭证文件: .monitor_auth.json (已加入 .gitignore)
-# 首次运行自动生成: username=admin, password=123456 (建议登录后立即修改)
+# 首次运行自动生成: username=admin, password=<随机强密码>
+# 如需指定初始密码，可设置 MONITOR_INITIAL_PASSWORD 环境变量。
 # 登录后 session 有效期 12 小时
 
 AUTH_FILE = BASE_DIR / ".monitor_auth.json"
 DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "123456"
+INITIAL_PASSWORD_ENV = "MONITOR_INITIAL_PASSWORD"
 SESSION_HOURS = 12
 MAX_LOGIN_ATTEMPTS = 5          # 连续失败上限
 LOGIN_LOCKOUT_SECONDS = 300     # 锁定 5 分钟
@@ -93,7 +95,7 @@ def _hash_password(password: str, salt: str) -> str:
 
 
 def _load_auth() -> dict:
-    """加载凭证, 首次运行时自动创建默认 admin/123456"""
+    """加载凭证, 首次运行时自动创建 admin 账户和强初始密码"""
     if AUTH_FILE.exists():
         try:
             with open(AUTH_FILE, 'r', encoding='utf-8') as f:
@@ -104,20 +106,27 @@ def _load_auth() -> dict:
             print(f"⚠️ {AUTH_FILE} 字段不完整, 重建默认凭证")
         except Exception as e:
             print(f"⚠️ 读取 {AUTH_FILE} 失败: {e}, 重建默认凭证")
-    # 首次创建
+    # 首次创建：优先使用显式环境变量，否则生成一次性强随机密码。
     salt = _secrets.token_hex(16)
+    initial_password = os.environ.get(INITIAL_PASSWORD_ENV) or _secrets.token_urlsafe(18)
+    password_source = "env" if os.environ.get(INITIAL_PASSWORD_ENV) else "generated"
     data = {
         'username': DEFAULT_USERNAME,
-        'password_hash': _hash_password(DEFAULT_PASSWORD, salt),
+        'password_hash': _hash_password(initial_password, salt),
         'salt': salt,
         'session_secret': _secrets.token_hex(32),
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'password_changed_at': None,
-        'is_default_password': True,
+        'is_default_password': False,
+        'initial_password_source': password_source,
     }
     _save_auth(data)
-    print(f"✅ 已创建默认凭证 → 用户名: {DEFAULT_USERNAME} 密码: {DEFAULT_PASSWORD}")
-    print(f"   ⚠️ 强烈建议登录后立即通过 /change_password 修改默认密码")
+    print(f"✅ 已创建监控面板凭证 → 用户名: {DEFAULT_USERNAME} 初始密码: {initial_password}")
+    if password_source == "generated":
+        print("   ⚠️ 该随机密码只会显示一次；如遗失请删除 .monitor_auth.json 后重启生成。")
+    else:
+        print(f"   ℹ️ 初始密码来自环境变量 {INITIAL_PASSWORD_ENV}")
+    print("   ⚠️ 建议登录后立即通过 /change_password 修改密码")
     return data
 
 
@@ -150,7 +159,7 @@ def _update_password(new_password: str) -> None:
     auth['salt'] = new_salt
     auth['password_hash'] = _hash_password(new_password, new_salt)
     auth['password_changed_at'] = datetime.now().isoformat(timespec='seconds')
-    auth['is_default_password'] = (new_password == DEFAULT_PASSWORD)
+    auth['is_default_password'] = False
     _save_auth(auth)
 
 
@@ -218,7 +227,7 @@ LOGIN_HTML = """<!DOCTYPE html>
     <div class="row"><label>密码</label><input type="password" name="password" required autofocus autocomplete="current-password"></div>
     <button type="submit">登录</button>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
-    {% if is_default %}<div class="warn">⚠️ 当前为默认密码 (123456), 登录后请立即修改</div>{% endif %}
+    {% if is_default %}<div class="warn">⚠️ 当前凭证来自旧版默认密码，请立即修改</div>{% endif %}
   </form>
 </div></body></html>"""
 
@@ -2021,7 +2030,7 @@ if __name__ == "__main__":
         LOG_FILE = BASE_DIR / f"{CURRENCY}-log.txt"
         _TRADE_DB_PATH = BASE_DIR / f"trading_{CURRENCY}_{_ENV_SUFFIX}.db"
 
-    # 认证状态展示 (启动时提示默认密码风险)
+    # 认证状态展示 (兼容旧版默认密码状态提示)
     _auth_status = _load_auth()
     _is_default = _auth_status.get('is_default_password', False)
 
@@ -2033,7 +2042,7 @@ if __name__ == "__main__":
     print(f"  地址: http://{args.host}:{args.port}")
     print(f"  认证: admin 账户 | session {SESSION_HOURS}h")
     if _is_default:
-        print(f"  ⚠️ 警告: 当前使用默认密码 ({DEFAULT_PASSWORD}), 登录后请立即 /change_password 修改")
+        print("  ⚠️ 警告: 当前凭证来自旧版默认密码，请立即 /change_password 修改")
     else:
         _changed = _auth_status.get('password_changed_at', '?')
         print(f"  ✅ 密码: 已自定义 (上次修改: {_changed})")

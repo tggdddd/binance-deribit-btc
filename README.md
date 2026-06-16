@@ -235,14 +235,21 @@ python binance-monitor.py --host 127.0.0.1 --port 5556
 http://127.0.0.1:5556
 ```
 
-默认登录信息：
+首次启动会在控制台输出监控面板初始登录信息：
 
 ```text
 用户名：admin
-密码：123456
+密码：启动时生成的一次性随机强密码
 ```
 
-首次登录后请立即进入 `/change_password` 修改默认密码。监控面板会在本地生成 `.monitor_auth.json`，该文件包含密码哈希和 session secret，已经被 `.gitignore` 忽略。
+如果希望手动指定首次密码，可在启动前设置环境变量：
+
+```bash
+export MONITOR_INITIAL_PASSWORD='替换为足够强的密码'
+python binance-monitor.py --host 127.0.0.1 --port 5556
+```
+
+首次登录后建议立即进入 `/change_password` 修改密码。监控面板会在本地生成 `.monitor_auth.json`，该文件包含密码哈希和 session secret，已经被 `.gitignore` 忽略。随机初始密码只会在首次创建凭证时显示一次；如果遗失且尚未改密，可删除 `.monitor_auth.json` 后重启监控面板重新生成。
 
 如果需要让局域网或公网访问监控面板，可以把 `--host` 改成 `0.0.0.0`，但必须配合防火墙、反向代理、HTTPS 和强密码，不建议直接裸露到公网。
 
@@ -381,7 +388,7 @@ sudo systemctl status binance-deribit
 - Binance API Key 建议限制 IP，并只开启需要的合约交易权限。
 - Deribit API Key 建议按环境区分测试网和实盘。
 - 实盘前先确认 `test_trading` 和 `use_testnet` 是否已经按预期切换。
-- 监控面板默认密码必须修改。
+- 监控面板首次随机密码只会显示一次，登录后建议立即修改并妥善保管。
 - 不建议直接把监控面板暴露到公网。
 - 自动交易前请确认止损、交易量、杠杆、保证金模式和最大持仓数量。
 

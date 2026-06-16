@@ -45,6 +45,7 @@ BASE_CONFIG = {
     "target_currency" : "BTC",      ########### 修 改 币 种 #############
     "test_trading" : True,          ######## False实盘，True测试网 #######
     "scan_interval_ms" : 500,       # 扫描间隔 (ms)
+    "max_wait_time" : 60,           # Maker 挂单最大等待时间 (秒)
     "futures_numbers" : 4,          # 只扫描最近几个到期日，DTE>72h 的期权会被过滤
     "current_tier" : "standard",    ###后续要验证获取的费用信息跟vip是否一致。Deribit 费率等级 'standard' 或 'vip1'
     "concurrent_batch_size" : 4,    # 每批并发执行数 (建议 3-5)

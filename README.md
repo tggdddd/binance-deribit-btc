@@ -186,7 +186,7 @@ python analysis/residual_diagnostics.py forecast_residuals.csv
 这组脚本按《预测：方法与实践》的思路做离线校准：
 
 - 使用滚动起点（rolling-origin）时间序列交叉验证，避免随机切分造成未来数据泄漏。
-- 先比较 naive、mean、drift、seasonal naive 等可解释基准模型，再考虑更复杂信号。
+- 先比较 naive、mean、drift、seasonal naive 等可解释基准模型；同时提供 `simple_union` 简单模型：用基准预测的中位数做点预测，并把各基准模型预测区间取并集作为保守约束，再考虑更复杂信号。
 - 输出 MAE、RMSE、MASE、方向命中率、残差偏差、分位数预测区间覆盖率等指标。
 - `forecast_residuals.csv` 保存逐起点残差；`residual_diagnostics.py` 会检查残差偏差、ACF(1)、Ljung-Box Q 统计量和预测区间欠覆盖。
 
